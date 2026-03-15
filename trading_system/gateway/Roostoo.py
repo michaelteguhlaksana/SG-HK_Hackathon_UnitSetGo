@@ -21,6 +21,8 @@ class RoostooClientV3:
         self.base_url = base_url.rstrip('/')
         self.client = httpx.AsyncClient(timeout=10.0)
 
+        self.available_pairs = set()
+
     async def close(self):
         await self.client.aclose()
 
