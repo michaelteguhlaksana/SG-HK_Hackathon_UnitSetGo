@@ -55,21 +55,20 @@ class RoostooClientV3:
             headers["RST-API-KEY"] = self.api_key
             headers["MSG-SIGNATURE"] = self._generate_signature(payload)
 
-        try:
-            if method.upper() == "GET":
-                response = await self.client.get(url, params=payload, headers=headers)
-            else:
-                # v3 uses form-encoding (data) instead of JSON for POST
-                response = await self.client.post(url, data=payload, headers=headers)
-            
-            response.raise_for_status()
+        if method.upper() == "GET":
+            response = await self.client.get(url, params=payload, headers=headers)
+        else:
+            # v3 uses form-encoding (data) instead of JSON for POST
+            response = await self.client.post(url, data=payload, headers=headers)
+        
+        response.raise_for_status()
+        data = response.json()
+
+        if data["Success"] or path == "/v3/serverTime" or path == "/v3/exchangeInfo":
             return response.json()
-        except httpx.HTTPStatusError as e:
-            logger.error(f"v3 API Error ({e.response.status_code}): {e.response.text}")
-            return {"error": e.response.status_code, "content": e.response.text}
-        except Exception as e:
-            logger.error(f"v3 Connection Error: {str(e)}")
-            return {"error": "connection_failed", "details": str(e)}
+        else:
+            logger.error(f"Request failed ({response.status_code}) :  {e.response.text}")
+            raise RoostooAPIError(f"API Error: {data.get('ErrMsg')}", status_code=response.status_code)
 
     # --- Public Endpoints (No Auth Required) ---
 
