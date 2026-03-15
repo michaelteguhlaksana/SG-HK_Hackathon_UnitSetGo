@@ -7,6 +7,13 @@ from typing import Dict, Any, Optional
 
 logger = logging.getLogger("RoostooV3")
 
+class RoostooAPIError(Exception):
+    """Custom exception for Roostoo API failures."""
+    def __init__(self, message, status_code=None):
+        self.message = message
+        self.status_code = status_code
+        super().__init__(self.message)
+
 class RoostooClientV3:
     def __init__(self, api_key: str, api_secret: str, base_url: str = "https://mock-api.roostoo.com"):
         self.api_key = api_key
