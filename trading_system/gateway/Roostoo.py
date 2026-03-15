@@ -1,10 +1,3 @@
-'''
-Gateway class for interacting with the Roostoo API
-
-@ Michael Teguh Laksana 15 March 2026 16:00
-'''
-
-
 import hmac
 import hashlib
 import time
@@ -12,93 +5,113 @@ import httpx
 import logging
 from typing import Dict, Any, Optional
 
-# Configure logging for the interface
-logger = logging.getLogger("RoostooInterface")
+logger = logging.getLogger("RoostooV3")
 
-class RoostooClient:
-    def __init__(self, api_key: str, api_secret: str, base_url: str = "https://api.roostoo.com"):
+class RoostooClientV3:
+    def __init__(self, api_key: str, api_secret: str, base_url: str = "https://mock-api.roostoo.com"):
         self.api_key = api_key
         self.api_secret = api_secret.encode('utf-8')
         self.base_url = base_url.rstrip('/')
         self.client = httpx.AsyncClient(timeout=10.0)
 
     async def close(self):
-        """Close the underlying HTTP client session."""
         await self.client.aclose()
 
-    def _generate_signature(self, timestamp: str, method: str, path: str, body: str = "") -> str:
+    def _generate_signature(self, params: Dict[str, Any]) -> str:
         """
-        Creates the HMAC SHA256 signature required by the API.
-        The message format is usually: timestamp + method + path + body
+        Signs the parameters by:
+        1. Sorting keys alphabetically.
+        2. Joining them into a query string (k1=v1&k2=v2).
+        3. HMAC-SHA256 signing with the secret.
         """
-        message = f"{timestamp}{method.upper()}{path}{body}"
-        signature = hmac.new(
+        # Note: We convert values to strings to match the demo's .format() logic
+        query_string = '&'.join([f"{k}={params[k]}" for k in sorted(params.keys())])
+        return hmac.new(
             self.api_secret,
-            message.encode('utf-8'),
+            query_string.encode('utf-8'),
             hashlib.sha256
         ).hexdigest()
-        return signature
 
-    async def _request(self, method: str, path: str, params: Optional[Dict] = None, json_data: Optional[Dict] = None) -> Dict[str, Any]:
-        """Core request handler with authentication headers."""
+    async def _request(self, method: str, path: str, params: Optional[Dict] = None, auth: bool = False) -> Dict[str, Any]:
+        """Generic request handler for v3."""
         url = f"{self.base_url}{path}"
-        timestamp = str(int(time.time() * 1000))
+        headers = {}
         
-        # Prepare body string for signature if it's a POST request
-        body_str = ""
-        if json_data:
-            # Note: Ensure JSON keys are sorted or consistent if the API requires it
-            import json
-            body_str = json.dumps(json_data, separators=(',', ':'))
-
-        headers = {
-            "Content-Type": "application/json",
-            "X-ROOSTOO-APIKEY": self.api_key,
-            "X-ROOSTOO-TIMESTAMP": timestamp,
-            "X-ROOSTOO-SIGNATURE": self._generate_signature(timestamp, method, path, body_str)
-        }
+        # Roostoo v3 quirk: Auth parameters are passed in the payload/query string itself
+        payload = params.copy() if params else {}
+        
+        if auth:
+            # Ensure timestamp is in milliseconds as per v3 demo
+            if "timestamp" not in payload:
+                payload["timestamp"] = int(time.time() * 1000)
+            
+            headers["RST-API-KEY"] = self.api_key
+            headers["MSG-SIGNATURE"] = self._generate_signature(payload)
 
         try:
-            response = await self.client.request(
-                method, url, params=params, content=body_str, headers=headers
-            )
+            if method.upper() == "GET":
+                response = await self.client.get(url, params=payload, headers=headers)
+            else:
+                # v3 uses form-encoding (data) instead of JSON for POST
+                response = await self.client.post(url, data=payload, headers=headers)
+            
             response.raise_for_status()
             return response.json()
         except httpx.HTTPStatusError as e:
-            logger.error(f"API Error ({e.response.status_code}): {e.response.text}")
-            return {"error": e.response.status_code, "message": e.response.text}
+            logger.error(f"v3 API Error ({e.response.status_code}): {e.response.text}")
+            return {"error": e.response.status_code, "content": e.response.text}
         except Exception as e:
-            logger.error(f"Connection Error: {str(e)}")
-            return {"error": "connection_failed", "message": str(e)}
+            logger.error(f"v3 Connection Error: {str(e)}")
+            return {"error": "connection_failed", "details": str(e)}
 
-    # --- Public API Methods ---
+    # --- Public Endpoints (No Auth Required) ---
 
-    async def get_market_data(self) -> Dict[str, Any]:
-        """Fetch real-time prices for all listed coins."""
-        return await self._request("GET", "/v1/market/quotes")
+    async def get_server_time(self):
+        return await self._request("GET", "/v3/serverTime")
 
-    async def get_account_balance(self) -> Dict[str, Any]:
-        """Fetch current portfolio holdings and buying power."""
-        return await self._request("GET", "/v1/account/balance")
+    async def get_exchange_info(self):
+        return await self._request("GET", "/v3/exchangeInfo")
 
-    async def place_order(self, symbol: str, side: str, order_type: str, quantity: float, price: Optional[float] = None) -> Dict[str, Any]:
+    async def get_ticker(self, pair: Optional[str] = None):
+        params = {}
+        if pair:
+            params["pair"] = pair
+        # Ticker often requires a timestamp in v3 even if not 'private'
+        params["timestamp"] = int(time.time()) 
+        return await self._request("GET", "/v3/ticker", params=params)
+
+    # --- Private Endpoints (Auth Required) ---
+
+    async def get_balance(self):
+        return await self._request("GET", "/v3/balance", auth=True)
+
+    async def place_order(self, symbol: str, side: str, quantity: float, price: Optional[float] = None):
         """
-        Place a trade.
+        symbol: e.g., 'BTC' (class adds /USD automatically to match demo)
         side: 'BUY' or 'SELL'
-        order_type: 'MARKET' or 'LIMIT'
         """
-        data = {
-            "symbol": symbol.upper(),
+        payload = {
+            "pair": f"{symbol.upper()}/USD",
             "side": side.upper(),
-            "type": order_type.upper(),
-            "quantity": str(quantity)
+            "quantity": quantity,
         }
         if price:
-            data["price"] = str(price)
+            payload["type"] = "LIMIT"
+            payload["price"] = price
+        else:
+            payload["type"] = "MARKET"
             
-        return await self._request("POST", "/v1/order/place", json_data=data)
+        return await self._request("POST", "/v3/place_order", params=payload, auth=True)
 
-    async def get_order_status(self, order_id: str) -> Dict[str, Any]:
-        """Check the status of a specific order."""
-        return await self._request("GET", f"/v1/order/status/{order_id}")
+    async def cancel_order(self, symbol: str = "BTC"):
+        payload = {"pair": f"{symbol.upper()}/USD"}
+        return await self._request("POST", "/v3/cancel_order", params=payload, auth=True)
 
+    async def query_order(self, order_id: Optional[int] = None):
+        payload = {}
+        if order_id:
+            payload["order_id"] = order_id
+        return await self._request("POST", "/v3/query_order", params=payload, auth=True)
+
+    async def get_pending_count(self):
+        return await self._request("GET", "/v3/pending_count", auth=True)
