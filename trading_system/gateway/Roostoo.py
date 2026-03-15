@@ -121,3 +121,45 @@ class RoostooClientV3:
 
     async def get_pending_count(self):
         return await self._request("GET", "/v3/pending_count", auth=True)
+
+
+    # --- Response handling ---
+    def handle_get_serverTime(self) -> int:
+        try:
+            ts = self.handle_response_error(self.get_server_time())
+            return ts["ServerTime"]
+            
+        except Exception as e:
+            logger.error("Failed to get time from server.")
+    
+    def _parse_coin_info (self, data : Dict[str, Any]):
+        #TODO: Should this send to the DB directly or should a separate function han dle this?
+        #This is likely only done on warm-up, so not blocking anything
+        return
+    
+    def _parse_ticker_price (self, data: Dict[str, Any]):
+        #TODO: Should this send to the DB directly or should a separate function han dle this?
+        #Unlike vefore, this will be called often. 
+        return
+
+    def handle_get_exchange_info(self) -> tuple[bool, float]:
+        try:
+            data = self.get_exchange_info()
+            is_running = data["IsRunning"]
+            init_wallet = data["InitialWallet"]
+            for pair, info in data["TradePairs"].items():
+                self._parse_coin_info(info)
+                self.available_pairs.add(pair)
+
+            return (is_running, init_wallet)
+        except Exception as e:
+            logger.error(f"Failed to get or parse exchange info: {e}")
+
+    def handle_get_ticker(self, pair: Optional[str] = None):
+        try:
+            data = self.get_ticker(pair)["Data"] #No need for the rest, checked before in _request
+            for ticker, price_data in data.items():
+                self._parse_ticker_price (price_data)
+
+        except Exception as e:
+            logger.error(f"Failed to get or parse ticker data: {e}")
