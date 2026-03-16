@@ -124,11 +124,55 @@ class RoostooClientV3:
 
         return await self._request("POST", "/v3/cancel_order", params=payload, auth=True)
 
-    async def query_order(self, order_id: Optional[int] = None):
-        payload = {}
-        if order_id:
-            payload["order_id"] = order_id
-        return await self._request("POST", "/v3/query_order", params=payload, auth=True)
+    async def query_order(
+        self, 
+        order_id: Optional[str | int] = None, 
+        pair: Optional[str] = None, 
+        pending_only: Optional[bool] = None,
+        offset: Optional[int] = None,
+        limit: Optional[int] = None
+    ) -> list[dict]:
+        """
+        Queries order history or current pending status.
+        
+        Constraints:
+        - If order_id is sent, no other optional parameters are allowed.
+        - Returns an empty list [] if no orders match (instead of raising an error).
+        """
+        # 1. Enforce API constraint: order_id is mutually exclusive with others
+        if order_id is not None:
+            if any(v is not None for v in [pair, pending_only, offset, limit]):
+                raise ValueError("Roostoo API: If 'order_id' is provided, no other optional parameters are allowed.")
+
+        payload = {
+            "timestamp": str(int(time.time() * 1000))  # 13-digit mandatory
+        }
+
+        # 2. Build payload based on provided params
+        if order_id: 
+            payload["order_id"] = str(order_id)
+        else:
+            if pair: 
+                payload["pair"] = f"{pair.upper()}"
+            if pending_only is not None: 
+                payload["pending_only"] = "TRUE" if pending_only else "FALSE"
+            if offset is not None: 
+                payload["offset"] = str(offset)
+            if limit is not None: 
+                payload["limit"] = str(limit)
+
+        try:
+            # 3. Execute request
+            res = await self._request("POST", "/v3/query_order", params=payload, auth=True)
+            return res.get("OrderMatched", [])
+            
+        except RoostooAPIError as e:
+            # 4. Handle the "No Match" case gracefully
+            # The API returns Success: False for "no order matched", but we want an empty list.
+            if "no order matched" in str(e).lower():
+                return []
+            # Re-raise if it's a real error (Unauthorized, Server Down, etc.)
+            raise e
 
     async def get_pending_count(self):
         return await self._request("GET", "/v3/pending_count", auth=True)
