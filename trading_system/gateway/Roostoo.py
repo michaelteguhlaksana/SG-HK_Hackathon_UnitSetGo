@@ -22,6 +22,7 @@ class RoostooClientV3:
         self.client = httpx.AsyncClient(timeout=10.0)
 
         self.available_pairs = set()
+        self.balance = dict()
 
     async def close(self):
         await self.client.aclose()
