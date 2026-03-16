@@ -77,7 +77,7 @@ class RoostooClientV3:
         if data["Success"] or path == "/v3/serverTime" or path == "/v3/exchangeInfo":
             return response.json()
         else:
-            logger.error(f"Request failed ({response.status_code}) :  {e.response.text}")
+            logger.error(f"Request failed ({response.status_code}) :  {response}")
             raise RoostooAPIError(f"API Error: {data.get('ErrMsg')}", status_code=response.status_code)
 
     # --- Public Endpoints (No Auth Required) ---
@@ -186,9 +186,9 @@ class RoostooClientV3:
 
 
     # --- Response handling ---
-    def handle_get_serverTime(self) -> int:
+    async def handle_get_serverTime(self) -> int:
         try:
-            ts = self.handle_response_error(self.get_server_time())
+            ts = await self.get_server_time()
             return ts["ServerTime"]
             
         except Exception as e:
@@ -212,16 +212,16 @@ class RoostooClientV3:
         volume = price_data.get("Volume", 0)
         
         # This now saves the live state AND the historical tick
-        await self.db.update_ticker(pair, price, volume)
+        await self.db_manager.update_ticker(pair, price, volume)
 
     async def handle_get_exchange_info(self) -> tuple[bool, float]:
         try:
-            data = self.get_exchange_info()
+            data = await self.get_exchange_info()
             is_running = data["IsRunning"]
             init_wallet = data["InitialWallet"]
             for pair, info in data["TradePairs"].items():
                 try:
-                    self._parse_coin_info(info)
+                    self._parse_coin_info(pair, info)
                     self.available_pairs.add(pair)
                 except Exception as e:
                     logger.error(f"Failed to parse data for pair {pair} : {e}")
@@ -231,34 +231,36 @@ class RoostooClientV3:
         except Exception as e:
             logger.error(f"Failed to get or parse exchange info: {e}")
 
-    def handle_get_ticker(self, pair: Optional[str] = None):
+    async def handle_get_ticker(self, pair: Optional[str] = None):
         try:
-            data = self.get_ticker(pair)["Data"] #No need for the rest, checked before in _request
-            for ticker, price_data in data.items():
+            data = await self.get_ticker(pair) 
+            for ticker, price_data in data["Data"].items():#No need for the rest, checked before in _request
                 try:
-                    self._parse_ticker_price (price_data)
+                    self._parse_ticker_price (ticker, price_data)
                 except Exception as e:
                     logger.error(f"Failed to get ticker data for {ticker} : {e}")
                     continue
         except Exception as e:
             logger.error(f"Failed to get or parse ticker data: {e}")
 
-    def handle_get_balance(self):
+    async def handle_get_balance(self):
         try:
-            self.balance = self.get_balance()["Wallet"] #No need for the rest, checked before in _request
+            response = await self.get_balance()
+            self.balance = response["Wallet"]  #No need for the rest, checked before in _request
         except Exception as e:
             logger.error(f"Failed to get balance information: {e}")
 
     async def update_order_data(self, order_detail: Dict):
         """Passes the order dictionary directly to the SQLite manager."""
         try:
-            await self.db.save_order(order_detail)
+            await self.db_manager.save_order(order_detail)
             logger.info(f"Order {order_detail.get('OrderID')} updated in DB (Status: {order_detail.get('Status')})")
         except Exception as e:
             logger.error(f"Failed to save order to DB: {e}")
 
     async def handle_place_order(self, symbol: str, side: str, quantity: float, price: Optional[float] = None):
-        for details in self.place_order(symbol, side, quantity, price)["OrderDetail"]:
+        response = await self.place_order(symbol, side, quantity, price) 
+        for details in response["OrderDetail"]:
             try:
                 await self.update_order_data(details)
             except Exception as e:
@@ -272,7 +274,7 @@ class RoostooClientV3:
             
             for oid in canceled_ids:
                 # Direct DB update using the ID provided by the API
-                await self.db.cancel_order_by_id(oid)
+                await self.db_manager.cancel_order_by_id(oid)
                 
         except Exception as e:
             logger.error(f"Failed to process cancellation: {e}")
