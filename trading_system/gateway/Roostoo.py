@@ -4,6 +4,7 @@ import time
 import httpx
 import logging
 from typing import Dict, Any, Optional
+import db.db_manager
 
 logger = logging.getLogger("RoostooV3")
 
@@ -12,6 +13,7 @@ class RoostooAPIError(Exception):
     def __init__(self, message, status_code=None):
         self.message = message
         self.status_code = status_code
+        self.db_manager = self.db_manager()
         super().__init__(self.message)
 
 class RoostooClientV3:
