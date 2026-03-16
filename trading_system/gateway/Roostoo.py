@@ -13,7 +13,7 @@ class RoostooAPIError(Exception):
     def __init__(self, message, status_code=None):
         self.message = message
         self.status_code = status_code
-        self.db_manager = self.db_manager()
+        self.db_manager = db.db_manager.DatabaseManager()
         super().__init__(self.message)
 
 class RoostooClientV3:
@@ -192,12 +192,16 @@ class RoostooClientV3:
     def _parse_coin_info (self, data : Dict[str, Any]):
         #TODO: Should this send to the DB directly or should a separate function han dle this?
         #This is likely only done on warm-up, so not blocking anything
+        # Not urgent, leave as is for now
         return
     
-    def _parse_ticker_price (self, data: Dict[str, Any]):
-        #TODO: Should this send to the DB directly or should a separate function han dle this?
-        #Unlike vefore, this will be called often. 
-        return
+    async def _parse_ticker_price(self, pair, price_data):
+        # Adjust based on Roostoo's exact keys (e.g., 'LastPrice', 'Volume')
+        price = price_data.get("LastPrice", 0)
+        volume = price_data.get("Volume", 0)
+        
+        # This now saves the live state AND the historical tick
+        await self.db.update_ticker(pair, price, volume)
 
     def handle_get_exchange_info(self) -> tuple[bool, float]:
         try:
@@ -234,23 +238,31 @@ class RoostooClientV3:
         except Exception as e:
             logger.error(f"Failed to get balance information: {e}")
 
-    def update_order_data (self, order_detail: Dict):
-        pass
+    async def update_order_data(self, order_detail: Dict):
+        """Passes the order dictionary directly to the SQLite manager."""
+        try:
+            await self.db.save_order(order_detail)
+            logger.info(f"Order {order_detail.get('OrderID')} updated in DB (Status: {order_detail.get('Status')})")
+        except Exception as e:
+            logger.error(f"Failed to save order to DB: {e}")
 
-    def handle_place_order(self, symbol: str, side: str, quantity: float, price: Optional[float] = None):
+    async def handle_place_order(self, symbol: str, side: str, quantity: float, price: Optional[float] = None):
         for details in self.place_order(symbol, side, quantity, price)["OrderDetail"]:
-            self.update_order_data(details)
+            try:
+                await self.update_order_data(details)
+            except Exception as e:
+                logger.error(f"Failed to handle response for placed order {details} : {e}")
 
-    def handle_cancel_order(self, order_id:Optional[int] = None, pair: Optional[str] = None):
+    async def handle_cancel_order(self, order_id:Optional[int] = None, pair: Optional[str] = None):
         canceled_id = self.cancel_order(order_id, pair)["CanceledList"]
         for oid in canceled_id:
             #TODO: Make update that only accept cancel
             try:
-                self.update_order_data(oid)
+                await self.update_order_data(oid)
             except Exception as e:
                 logger.error(f"Failed to cancel order ID: {oid}")
 
-    def handle_query_order (self, 
+    async def handle_query_order (self, 
         order_id: Optional[str | int] = None, 
         pair: Optional[str] = None, 
         pending_only: Optional[bool] = None,
@@ -260,7 +272,7 @@ class RoostooClientV3:
         res = self.query_order(self, order_id, pair, pending_only, offset, limit)
         for order_detail in res:
             try:
-                self.update_order_data(order_detail)
+                await self.update_order_data(order_detail)
             except Exception as e:
                 logger.error(f"Failed to update order {order_detail}")
 
