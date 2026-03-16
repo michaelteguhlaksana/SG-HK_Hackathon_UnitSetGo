@@ -224,3 +224,41 @@ class RoostooClientV3:
                     continue
         except Exception as e:
             logger.error(f"Failed to get or parse ticker data: {e}")
+
+    def handle_get_balance(self):
+        try:
+            self.balance = self.get_balance()["Wallet"] #No need for the rest, checked before in _request
+        except Exception as e:
+            logger.error(f"Failed to get balance information: {e}")
+
+    def update_order_data (self, order_detail: Dict):
+        pass
+
+    def handle_place_order(self, symbol: str, side: str, quantity: float, price: Optional[float] = None):
+        for details in self.place_order(symbol, side, quantity, price)["OrderDetail"]:
+            self.update_order_data(details)
+
+    def handle_cancel_order(self, order_id:Optional[int] = None, pair: Optional[str] = None):
+        canceled_id = self.cancel_order(order_id, pair)["CanceledList"]
+        for oid in canceled_id:
+            #TODO: Make update that only accept cancel
+            try:
+                self.update_order_data(oid)
+            except Exception as e:
+                logger.error(f"Failed to cancel order ID: {oid}")
+
+    def handle_query_order (self, 
+        order_id: Optional[str | int] = None, 
+        pair: Optional[str] = None, 
+        pending_only: Optional[bool] = None,
+        offset: Optional[int] = None,
+        limit: Optional[int] = None):
+        
+        res = self.query_order(self, order_id, pair, pending_only, offset, limit)
+        for order_detail in res:
+            try:
+                self.update_order_data(order_detail)
+            except Exception as e:
+                logger.error(f"Failed to update order {order_detail}")
+
+    
