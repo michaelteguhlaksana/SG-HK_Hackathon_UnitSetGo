@@ -13,15 +13,19 @@ class RoostooAPIError(Exception):
     def __init__(self, message, status_code=None):
         self.message = message
         self.status_code = status_code
-        self.db_manager = db.db_manager.DatabaseManager()
+        
         super().__init__(self.message)
 
 class RoostooClientV3:
-    def __init__(self, api_key: str, api_secret: str, base_url: str = "https://mock-api.roostoo.com"):
+    def __init__(self, api_key: str, api_secret: str, db_manager:db.db_manager.DatabaseManager = None, base_url: str = "https://mock-api.roostoo.com"):
         self.api_key = api_key
         self.api_secret = api_secret.encode('utf-8')
         self.base_url = base_url.rstrip('/')
         self.client = httpx.AsyncClient(timeout=10.0)
+        if db_manager == None:
+            self.db_manager = db.db_manager.DatabaseManager()
+        else:
+            self.db_manager = self.db_manager
 
         self.available_pairs = set()
         self.balance = dict()
