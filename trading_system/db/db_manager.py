@@ -81,6 +81,18 @@ class DatabaseManager:
             ))
             await db.commit()
 
+    async def cancel_order_by_id(self, order_id: str):
+        """Updates an existing order's status to CANCELED."""
+        ts = int(time.time() * 1000)
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("""
+                UPDATE orders 
+                SET status = 'CANCELED', timestamp = ? 
+                WHERE order_id = ?
+            """, (ts, str(order_id)))
+            await db.commit()
+            logger.info(f"DB: Order {order_id} marked as CANCELED.")
+
     # --- Price Methods (Real-time & History) ---
     async def update_ticker(self, pair: str, price: float, volume: float = 0.0):
         """

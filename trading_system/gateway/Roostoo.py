@@ -253,27 +253,30 @@ class RoostooClientV3:
             except Exception as e:
                 logger.error(f"Failed to handle response for placed order {details} : {e}")
 
-    async def handle_cancel_order(self, order_id:Optional[int] = None, pair: Optional[str] = None):
-        canceled_id = self.cancel_order(order_id, pair)["CanceledList"]
-        for oid in canceled_id:
-            #TODO: Make update that only accept cancel
-            try:
-                await self.update_order_data(oid)
-            except Exception as e:
-                logger.error(f"Failed to cancel order ID: {oid}")
+    async def handle_cancel_order(self, order_id: Optional[int] = None, pair: Optional[str] = None):
+        try:
+            # We must await the API call itself
+            response = await self.cancel_order(order_id, pair)
+            canceled_ids = response.get("CanceledList", [])
+            
+            for oid in canceled_ids:
+                # Direct DB update using the ID provided by the API
+                await self.db.cancel_order_by_id(oid)
+                
+        except Exception as e:
+            logger.error(f"Failed to process cancellation: {e}")
 
-    async def handle_query_order (self, 
-        order_id: Optional[str | int] = None, 
-        pair: Optional[str] = None, 
-        pending_only: Optional[bool] = None,
-        offset: Optional[int] = None,
-        limit: Optional[int] = None):
-        
-        res = self.query_order(self, order_id, pair, pending_only, offset, limit)
+    async def handle_query_order(self, order_id=None, pair=None, pending_only=None, offset=None, limit=None):
+        res = await self.query_order(
+            order_id=order_id, 
+            pair=pair, 
+            pending_only=pending_only, 
+            offset=offset, 
+            limit=limit
+        )
         for order_detail in res:
             try:
                 await self.update_order_data(order_detail)
             except Exception as e:
-                logger.error(f"Failed to update order {order_detail}")
-
+                logger.error(f"Failed to update order {order_detail}: {e}")
     
