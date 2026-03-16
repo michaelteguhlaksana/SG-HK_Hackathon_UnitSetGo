@@ -111,8 +111,17 @@ class RoostooClientV3:
             
         return await self._request("POST", "/v3/place_order", params=payload, auth=True)
 
-    async def cancel_order(self, symbol: str = "BTC"):
-        payload = {"pair": f"{symbol.upper()}/USD"}
+    async def cancel_order(self, order_id:Optional[int] = None, pair: Optional[str] = None):
+        if order_id is not None and pair is not None:
+            raise ValueError("API allows only one of 'order_id' or 'pair' to be sent, not both.")
+        payload = {}
+        if order_id:
+            payload["order_id"] = str(order_id)
+        elif pair is not None:
+            # Ensure format is 'BASE/QUOTE' if user just passes 'BTC'
+            formatted_pair = pair if "/" in pair else f"{pair.upper()}/USD"
+            payload["pair"] = formatted_pair
+
         return await self._request("POST", "/v3/cancel_order", params=payload, auth=True)
 
     async def query_order(self, order_id: Optional[int] = None):
