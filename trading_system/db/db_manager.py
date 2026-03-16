@@ -1,6 +1,6 @@
 '''
 Classes for managing the interface to the database
-Supports Orders, Real-time Tickers, and Historical OHLCV Candles.
+Supports Orders, Real-time Tickers, and Historical Tick Data.
 
 @ MTL 16 March 2026
 '''
@@ -21,7 +21,6 @@ class DatabaseManager:
             # 1. Performance Optimizations
             await db.execute("PRAGMA journal_mode=WAL;")
             await db.execute("PRAGMA synchronous=NORMAL;")
-            # Allocate ~128MB of RAM for SQLite cache to speed up historical queries
             await db.execute("PRAGMA cache_size = -128000;") 
             
             # 2. Create Orders Table
@@ -38,38 +37,38 @@ class DatabaseManager:
                 )
             """)
             
-            # 3. Create Tickers Table (Latest Price Only)
+            # 3. Create Tickers Table (Latest State - The "Data Bus")
+            # This allows strategies to get the current price without scanning history.
             await db.execute("""
                 CREATE TABLE IF NOT EXISTS tickers (
                     pair TEXT PRIMARY KEY,
                     last_price REAL,
+                    last_volume REAL,
                     timestamp INTEGER
                 )
             """)
 
-            # 4. Create Candles Table (Historical OHLCV)
+            # 4. Create Ticks Table (Historical Log)
+            # We use a composite primary key to prevent duplicate entries if the API is polled twice in 1ms.
             await db.execute("""
-                CREATE TABLE IF NOT EXISTS candles (
+                CREATE TABLE IF NOT EXISTS ticks (
                     pair TEXT,
-                    timestamp INTEGER,
-                    open REAL,
-                    high REAL,
-                    low REAL,
-                    close REAL,
+                    price REAL,
                     volume REAL,
+                    timestamp INTEGER,
                     PRIMARY KEY (pair, timestamp)
                 )
             """)
             
-            # 5. Index for fast strategy lookback (Descending time)
-            await db.execute("CREATE INDEX IF NOT EXISTS idx_candle_lookup ON candles (pair, timestamp DESC);")
+            # 5. Index for fast strategy lookback
+            await db.execute("CREATE INDEX IF NOT EXISTS idx_tick_lookup ON ticks (pair, timestamp DESC);")
             
             await db.commit()
-            logger.info("Database initialized: WAL mode enabled, Indexes created.")
+            logger.info("Database initialized: Tick history enabled.")
 
     # --- Order Methods ---
     async def save_order(self, order: Dict[str, Any]):
-        """Saves or updates an order. Handles the Roostoo response structure."""
+        """Saves or updates an order status."""
         async with aiosqlite.connect(self.db_path) as db:
             await db.execute("""
                 INSERT INTO orders (order_id, pair, side, type, quantity, price, status, timestamp)
@@ -82,68 +81,65 @@ class DatabaseManager:
             ))
             await db.commit()
 
-    # --- Price Methods (Real-time Feed) ---
-    async def update_ticker(self, pair: str, price: float):
-        """Updates the latest price for a pair (used for quick RAM-like access)."""
+    # --- Price Methods (Real-time & History) ---
+    async def update_ticker(self, pair: str, price: float, volume: float = 0.0):
+        """
+        Updates the current price and logs it to history.
+        Called by _parse_ticker_price.
+        """
+        ts = int(time.time() * 1000)
         async with aiosqlite.connect(self.db_path) as db:
-            await db.execute("""
-                INSERT INTO tickers (pair, last_price, timestamp)
-                VALUES (?, ?, ?)
-                ON CONFLICT(pair) DO UPDATE SET 
-                    last_price=excluded.last_price,
-                    timestamp=excluded.timestamp
-            """, (pair, price, int(time.time() * 1000)))
+            # We do both in one transaction for speed
+            async with db.cursor() as cursor:
+                # 1. Update the "Live" state
+                await cursor.execute("""
+                    INSERT INTO tickers (pair, last_price, last_volume, timestamp)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(pair) DO UPDATE SET 
+                        last_price=excluded.last_price,
+                        last_volume=excluded.last_volume,
+                        timestamp=excluded.timestamp
+                """, (pair, price, volume, ts))
+
+                # 2. Append to the "Historical" log
+                await cursor.execute("""
+                    INSERT INTO ticks (pair, price, volume, timestamp)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(pair, timestamp) DO NOTHING
+                """, (pair, price, volume, ts))
+            
             await db.commit()
 
-    async def get_latest_price(self, pair: str) -> float:
-        """Fetch the single most recent price for a pair."""
+    async def get_latest_price(self, pair: str) -> Dict[str, Any]:
+        """Fetch the current market state for a pair."""
         async with aiosqlite.connect(self.db_path) as db:
-            async with db.execute("SELECT last_price FROM tickers WHERE pair = ?", (pair,)) as cursor:
+            db.row_factory = aiosqlite.Row
+            async with db.execute("SELECT * FROM tickers WHERE pair = ?", (pair,)) as cursor:
                 row = await cursor.fetchone()
-                return row[0] if row else 0.0
+                return dict(row) if row else {"last_price": 0.0, "last_volume": 0.0, "timestamp": 0}
 
-    # --- Historical Methods (Strategy Lookback) ---
-    async def save_candle(self, pair: str, candle_data: Dict[str, Any]):
+    # --- Historical Methods ---
+    async def get_tick_history(self, pair: str, limit: int = 100) -> List[Dict]:
         """
-        Saves a 1-minute OHLCV candle. 
-        candle_data should have keys: timestamp, open, high, low, close, volume.
+        Returns the last N historical ticks for a pair.
+        Sorted from OLDEST to NEWEST.
         """
         async with aiosqlite.connect(self.db_path) as db:
-            await db.execute("""
-                INSERT INTO candles (pair, timestamp, open, high, low, close, volume)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(pair, timestamp) DO UPDATE SET
-                    open=excluded.open, high=excluded.high, low=excluded.low,
-                    close=excluded.close, volume=excluded.volume
-            """, (
-                pair, candle_data['timestamp'], candle_data['open'],
-                candle_data['high'], candle_data['low'], candle_data['close'],
-                candle_data['volume']
-            ))
-            await db.commit()
-
-    async def get_history(self, pair: str, limit: int = 100) -> List[Dict]:
-        """
-        Returns the last N candles for a specific pair.
-        Sorted from OLDEST to NEWEST (ready for technical indicator calculations).
-        """
-        async with aiosqlite.connect(self.db_path) as db:
-            db.row_factory = aiosqlite.Row # Allows access by column name
+            db.row_factory = aiosqlite.Row
             async with db.execute("""
-                SELECT timestamp, open, high, low, close, volume 
-                FROM candles 
+                SELECT timestamp, price, volume 
+                FROM ticks 
                 WHERE pair = ? 
                 ORDER BY timestamp DESC 
                 LIMIT ?
             """, (pair, limit)) as cursor:
                 rows = await cursor.fetchall()
-                # Reverse the results to return chronological order (oldest -> newest)
                 return [dict(row) for row in rows][::-1]
 
-    async def prune_history(self, days_to_keep: int = 7):
-        """Optional: Keeps the 30GB disk from filling up over long periods."""
-        cutoff = int((time.time() - (days_to_keep * 86400)) * 1000)
+    async def prune_ticks(self, hours_to_keep: int = 48):
+        """Cleans up old ticks to save space and maintain query speed."""
+        cutoff = int((time.time() - (hours_to_keep * 3600)) * 1000)
         async with aiosqlite.connect(self.db_path) as db:
-            await db.execute("DELETE FROM candles WHERE timestamp < ?", (cutoff,))
+            await db.execute("DELETE FROM ticks WHERE timestamp < ?", (cutoff,))
             await db.commit()
-            logger.info(f"Pruned historical data older than {days_to_keep} days.")
+            logger.info(f"Pruned ticks older than {hours_to_keep} hours.")
