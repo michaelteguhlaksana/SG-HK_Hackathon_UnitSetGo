@@ -202,8 +202,12 @@ class RoostooClientV3:
             is_running = data["IsRunning"]
             init_wallet = data["InitialWallet"]
             for pair, info in data["TradePairs"].items():
-                self._parse_coin_info(info)
-                self.available_pairs.add(pair)
+                try:
+                    self._parse_coin_info(info)
+                    self.available_pairs.add(pair)
+                except Exception as e:
+                    logger.error(f"Failed to parse data for pair {pair} : {e}")
+                    continue
 
             return (is_running, init_wallet)
         except Exception as e:
@@ -213,7 +217,10 @@ class RoostooClientV3:
         try:
             data = self.get_ticker(pair)["Data"] #No need for the rest, checked before in _request
             for ticker, price_data in data.items():
-                self._parse_ticker_price (price_data)
-
+                try:
+                    self._parse_ticker_price (price_data)
+                except Exception as e:
+                    logger.error(f"Failed to get ticker data for {ticker} : {e}")
+                    continue
         except Exception as e:
             logger.error(f"Failed to get or parse ticker data: {e}")
