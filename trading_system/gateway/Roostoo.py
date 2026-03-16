@@ -25,6 +25,7 @@ class RoostooClientV3:
 
         self.available_pairs = set()
         self.balance = dict()
+        self.market_rules = {}
 
     async def close(self):
         await self.client.aclose()
@@ -189,11 +190,17 @@ class RoostooClientV3:
         except Exception as e:
             logger.error("Failed to get time from server.")
     
-    def _parse_coin_info (self, data : Dict[str, Any]):
-        #TODO: Should this send to the DB directly or should a separate function han dle this?
-        #This is likely only done on warm-up, so not blocking anything
-        # Not urgent, leave as is for now
-        return
+    def _parse_coin_info(self, pair: str, info: Dict[str, Any]):
+        """
+        Stores constraints for each pair to prevent API rejection.
+        """
+        self.market_rules[pair] = {
+            "min_qty": float(info.get("MinQuantity", 0)),
+            "price_precision": int(info.get("PricePrecision", 2)),
+            "qty_precision": int(info.get("QuantityPrecision", 8)),
+            "min_notional": float(info.get("MinNotional", 10.0))
+        }
+        logger.info(f"Rules updated for {pair}: MinQty {self.market_rules[pair]['min_qty']}")
     
     async def _parse_ticker_price(self, pair, price_data):
         # Adjust based on Roostoo's exact keys (e.g., 'LastPrice', 'Volume')
@@ -203,7 +210,7 @@ class RoostooClientV3:
         # This now saves the live state AND the historical tick
         await self.db.update_ticker(pair, price, volume)
 
-    def handle_get_exchange_info(self) -> tuple[bool, float]:
+    async def handle_get_exchange_info(self) -> tuple[bool, float]:
         try:
             data = self.get_exchange_info()
             is_running = data["IsRunning"]
