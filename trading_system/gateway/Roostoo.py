@@ -84,8 +84,7 @@ class RoostooClientV3:
         params = {}
         if pair:
             params["pair"] = pair
-        # Ticker often requires a timestamp in v3 even if not 'private'
-        params["timestamp"] = int(time.time()) 
+        params["timestamp"] = int(time.time()* 1000) 
         return await self._request("GET", "/v3/ticker", params=params)
 
     # --- Private Endpoints (Auth Required) ---
