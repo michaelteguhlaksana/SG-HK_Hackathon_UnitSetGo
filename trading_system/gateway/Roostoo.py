@@ -25,7 +25,7 @@ class RoostooClientV3:
         if db_manager == None:
             self.db_manager = db.db_manager.DatabaseManager()
         else:
-            self.db_manager = self.db_manager
+            self.db_manager = db_manager
 
         self.available_pairs = set()
         self.balance = dict()
