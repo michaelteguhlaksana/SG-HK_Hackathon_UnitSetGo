@@ -6,44 +6,55 @@ Parent class of strategies
 import asyncio
 import logging
 from abc import ABC, abstractmethod
-from typing import Optional
+from typing import List, Dict, Optional, Any
 from db.db_manager import DatabaseManager
 
 class BaseStrategy(ABC):
-    def __init__(self, strategy_name: str, symbol: str):
+    def __init__(self, strategy_name: str, symbols: List[str], db_path: str = "./trading_bot.db"):
+        """
+        symbols: List of coins this strategy monitors, e.g., ['BTC', 'ETH']
+        """
         self.name = strategy_name
-        self.symbol = symbol.upper()
-        self.db = DatabaseManager() # Strategy only talks to DB
+        # Convert ['BTC'] to ['BTC/USD'] for DB lookups
+        self.pairs = [f"{s.upper()}/USD" if "/" not in s else s.upper() for s in symbols]
+        
+        self.db = DatabaseManager(db_path)
         self.logger = logging.getLogger(self.name)
         self.is_running = False
 
     async def run(self, poll_interval: float = 0.5):
         self.is_running = True
-        self.logger.info(f"Strategy {self.name} started.")
+        self.logger.info(f"Strategy {self.name} monitoring {self.pairs}...")
         
         while self.is_running:
-            # 1. Pull latest market data from DB (written by Master)
-            market_state = await self.db.get_latest_ticker(f"{self.symbol}")
-            
-            if market_state:
-                await self.on_tick(market_state)
-            
-            await asyncio.sleep(poll_interval)
+            try:
+                # 1. Bulk fetch all relevant market data in one DB hit
+                market_state = await self.db.get_latest_price_batch(self.pairs)
+                
+                if market_state:
+                    # 2. Pass the full dict of prices to the strategy logic
+                    await self.on_tick(market_state)
+                
+                await asyncio.sleep(poll_interval)
+            except Exception as e:
+                self.logger.error(f"Strategy loop error: {e}")
+                await asyncio.sleep(2)
 
     @abstractmethod
-    async def on_tick(self, market_data: dict):
-        """Logic goes here. Use self.submit_order_intent() to trade."""
+    async def on_tick(self, market_data: Dict[str, Dict]):
+        """
+        Example usage in child class:
+        btc_price = market_data['BTC/USD']['last_price']
+        """
         pass
 
-    async def submit_order_intent(self, side: str, quantity: float, price: Optional[float] = None):
-        """Writes an 'Intent' to the DB for the Master to pick up."""
+    async def submit_order_intent(self, symbol: str, side: str, quantity: float, price: Optional[float] = None):
+        """Standardized way to send a trade request to the Master Allocator."""
         intent = {
-            "strategy_name": self.name,
-            "symbol": self.symbol,
+            "name": self.name,
+            "symbol": symbol.upper(),
             "side": side.upper(),
             "quantity": quantity,
-            "price": price,
-            "status": "PENDING"
+            "price": price
         }
         await self.db.save_order_intent(intent)
-        self.logger.info(f"Intent submitted: {side} {quantity} {self.symbol}")
