@@ -64,6 +64,7 @@ class TradingBot:
             
             try:
                 # 1. Execute on Exchange
+                await self.db.update_intent_status(intent_id, "PROCESSING")
                 logger.info(f"Master executing intent from {intent['strategy_name']}: {intent['side']} {intent['quantity']} {symbol}")
                 
                 await self.client.handle_place_order(
