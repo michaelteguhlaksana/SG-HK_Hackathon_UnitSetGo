@@ -251,7 +251,7 @@ class RoostooClientV3:
     async def handle_get_balance(self):
         try:
             response = await self.get_balance()
-            self.balance = response["Wallet"]  #No need for the rest, checked before in _request
+            self.balance = response.get("Wallet", 0)  #No need for the rest, checked before in _request
         except Exception as e:
             logger.error(f"Failed to get balance information: {e}")
 
@@ -265,7 +265,7 @@ class RoostooClientV3:
 
     async def handle_place_order(self, symbol: str, side: str, quantity: float, price: Optional[float] = None):
         response = await self.place_order(symbol, side, quantity, price) 
-        for details in response["OrderDetail"]:
+        for details in response.get("OrderDetail", []):
             try:
                 await self.update_order_data(details)
             except Exception as e:
