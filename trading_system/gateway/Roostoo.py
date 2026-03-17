@@ -205,14 +205,6 @@ class RoostooClientV3:
             "min_notional": float(info.get("MinNotional", 10.0))
         }
         logger.info(f"Rules updated for {pair}: MinQty {self.market_rules[pair]['min_qty']}")
-    
-    async def _parse_ticker_price(self, pair, price_data):
-        # Adjust based on Roostoo's exact keys (e.g., 'LastPrice', 'Volume')
-        price = price_data.get("LastPrice", 0)
-        volume = price_data.get("UnitTradeValue", 0)
-        
-        # This now saves the live state AND the historical tick
-        await self.db_manager.update_ticker(pair, price, volume)
 
     async def handle_get_exchange_info(self) -> tuple[bool, float]:
         try:
@@ -234,14 +226,27 @@ class RoostooClientV3:
     async def handle_get_ticker(self, pair: Optional[str] = None):
         try:
             data = await self.get_ticker(pair) 
-            for ticker, price_data in data["Data"].items():#No need for the rest, checked before in _request
+            
+            # Accumulate all tickers into a list
+            ticker_batch = []
+            for ticker_name, price_data in data.get("Data", {}).items():
                 try:
-                    self._parse_ticker_price (ticker, price_data)
+                    # Parse but don't save yet
+                    parsed_data = {
+                        "pair": ticker_name,
+                        "price": float(price_data.get("LastPrice", 0)),
+                        "volume": float(price_data.get("UnitTradeValue", 0))
+                    }
+                    ticker_batch.append(parsed_data)
                 except Exception as e:
-                    logger.error(f"Failed to get ticker data for {ticker} : {e}")
-                    continue
+                    logger.error(f"Failed to parse ticker {ticker_name}: {e}")
+                    
+            # Send them all to the database in ONE lightning-fast transaction
+            if ticker_batch:
+                await self.db_manager.update_tickers_batch(ticker_batch)
+
         except Exception as e:
-            logger.error(f"Failed to get or parse ticker data: {e}")
+            logger.error(f"Failed to fetch ticker data: {e}")
 
     async def handle_get_balance(self):
         try:
