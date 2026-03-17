@@ -52,14 +52,34 @@ class TradingBot:
 
     async def run_allocator(self):
         """
-        Placeholder for allocation/Risk Management logic.
-        This reads from the DB and decides whether to place orders.
+        Reads pending intents from strategies and executes them.
         """
-        # 1. Fetch latest history for a pair
-        # history = await self.db.get_tick_history("BTC/USD", limit=20)
+        pending_intents = await self.db.get_pending_intents()
+
+        #TODO: Handle risk maangement and sizing here
         
-        # 2. Apply Risk/Strategy logic...
-        pass
+        for intent in pending_intents:
+            intent_id = intent['id']
+            symbol = intent['symbol']
+            
+            try:
+                # 1. Execute on Exchange
+                logger.info(f"Master executing intent from {intent['strategy_name']}: {intent['side']} {intent['quantity']} {symbol}")
+                
+                await self.client.handle_place_order(
+                    symbol=symbol,
+                    side=intent['side'],
+                    quantity=intent['quantity'],
+                    price=intent.get('price')
+                )
+                
+                # 2. Mark as processed so we don't buy it again next loop
+                await self.db.update_intent_status(intent_id, "EXECUTED")
+                
+            except Exception as e:
+                logger.error(f"Failed to execute intent {intent_id}: {e}")
+                # Optional: Mark as FAILED so it doesn't get stuck in an infinite retry loop
+                await self.db.update_intent_status(intent_id, "FAILED")
 
     async def data_cycle(self):
         """Main loop for fetching tickers and running strategy."""
