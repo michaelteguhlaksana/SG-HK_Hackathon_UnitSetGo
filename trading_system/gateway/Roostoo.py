@@ -209,7 +209,7 @@ class RoostooClientV3:
     async def _parse_ticker_price(self, pair, price_data):
         # Adjust based on Roostoo's exact keys (e.g., 'LastPrice', 'Volume')
         price = price_data.get("LastPrice", 0)
-        volume = price_data.get("Volume", 0)
+        volume = price_data.get("UnitTradeValue", 0)
         
         # This now saves the live state AND the historical tick
         await self.db_manager.update_ticker(pair, price, volume)
