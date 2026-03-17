@@ -63,6 +63,19 @@ class DatabaseManager:
             # 5. Index for fast strategy lookback
             await db.execute("CREATE INDEX IF NOT EXISTS idx_tick_lookup ON ticks (pair, timestamp DESC);")
             
+            # 6. Order Intents Table (The Bridge between Strategy and Master)
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS order_intents (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    strategy_name TEXT,
+                    symbol TEXT,
+                    side TEXT,
+                    quantity REAL,
+                    price REAL,
+                    status TEXT DEFAULT 'PENDING',
+                    timestamp INTEGER
+                )
+            """)
             await db.commit()
             logger.info("Database initialized: Tick history enabled.")
 
@@ -92,6 +105,57 @@ class DatabaseManager:
             """, (ts, str(order_id)))
             await db.commit()
             logger.info(f"DB: Order {order_id} marked as CANCELED.")
+
+    async def update_tickers_batch(self, ticker_data_list: List[Dict[str, Any]]):
+        """
+        Updates multiple tickers in a single transaction.
+        ticker_data_list should be a list of dicts: [{'pair': 'BTC/USD', 'price': 9000.0, 'volume': 1000.0}, ...]
+        """
+        ts = int(time.time() * 1000)
+        async with aiosqlite.connect(self.db_path) as db:
+            # Update Live Bus
+            await db.executemany("""
+                INSERT INTO tickers (pair, last_price, last_volume, timestamp)
+                VALUES (:pair, :price, :volume, :ts)
+                ON CONFLICT(pair) DO UPDATE SET 
+                    last_price=excluded.last_price,
+                    last_volume=excluded.last_volume,
+                    timestamp=excluded.timestamp
+            """, [{**d, 'ts': ts} for d in ticker_data_list])
+
+            # Log History
+            await db.executemany("""
+                INSERT INTO ticks (pair, price, volume, timestamp)
+                VALUES (:pair, :price, :volume, :ts)
+                ON CONFLICT(pair, timestamp) DO NOTHING
+            """, [{**d, 'ts': ts} for d in ticker_data_list])
+            
+            await db.commit()
+
+    async def save_order_intent(self, intent: Dict[str, Any]):
+        """Called by a Strategy to request a trade."""
+        ts = int(time.time() * 1000)
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("""
+                INSERT INTO order_intents (strategy_name, symbol, side, quantity, price, timestamp)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (intent['name'], intent['symbol'], intent['side'], 
+                intent['quantity'], intent['price'], ts))
+            await db.commit()
+
+    async def get_pending_intents(self) -> List[Dict]:
+        """Called by the Master Allocator to see what needs to be executed."""
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute("SELECT * FROM order_intents WHERE status = 'PENDING'") as cursor:
+                rows = await cursor.fetchall()
+                return [dict(row) for row in rows]
+
+    async def update_intent_status(self, intent_id: int, status: str):
+        """Marks an intent as 'EXECUTED', 'REJECTED', or 'CANCELLED'."""
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("UPDATE order_intents SET status = ? WHERE id = ?", (status, intent_id))
+            await db.commit()
 
     # --- Price Methods (Real-time & History) ---
     async def update_ticker(self, pair: str, price: float, volume: float = 0.0):
@@ -129,6 +193,28 @@ class DatabaseManager:
             async with db.execute("SELECT * FROM tickers WHERE pair = ?", (pair,)) as cursor:
                 row = await cursor.fetchone()
                 return dict(row) if row else {"last_price": 0.0, "last_volume": 0.0, "timestamp": 0}
+            
+    async def get_latest_price_batch(self, pairs: Optional[List[str]] = None) -> Dict[str, Dict[str, Any]]:
+        """
+        Fetches the latest state for multiple pairs.
+        If pairs is None, returns all tickers in the database.
+        """
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            
+            if pairs:
+                # SQLite doesn't support binding lists directly, so we build the placeholders
+                placeholders = ','.join(['?'] * len(pairs))
+                query = f"SELECT * FROM tickers WHERE pair IN ({placeholders})"
+                params = pairs
+            else:
+                query = "SELECT * FROM tickers"
+                params = ()
+
+            async with db.execute(query, params) as cursor:
+                rows = await cursor.fetchall()
+                # Return as { 'BTC/USD': { 'last_price': 9000, ... }, ... }
+                return {row['pair']: dict(row) for row in rows}
 
     # --- Historical Methods ---
     async def get_tick_history(self, pair: str, limit: int = 100) -> List[Dict]:
