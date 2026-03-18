@@ -74,7 +74,7 @@ class RoostooClientV3:
         response.raise_for_status()
         data = response.json()
 
-        if data["Success"] or path == "/v3/serverTime" or path == "/v3/exchangeInfo":
+        if path == "/v3/serverTime" or path == "/v3/exchangeInfo" or data["Success"]:
             return response.json()
         else:
             logger.error(f"Request failed ({response.status_code}) :  {response}")
