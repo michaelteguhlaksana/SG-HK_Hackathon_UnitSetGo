@@ -6,6 +6,7 @@ import json
 import time
 import pandas as pd
 import numpy as np
+from typing import Dict, Any, Optional
 from db.db_manager import DatabaseManager
 from gateway.Roostoo import RoostooClientV3
 
@@ -16,6 +17,7 @@ logging.basicConfig(
     handlers=[logging.StreamHandler(sys.stdout)]
 )
 logger = logging.getLogger("MainLoop")
+
 
 class TradingBot:
     def __init__(self, cred_path="./config/credentials.json", db_path="./config/db.json"):
@@ -30,273 +32,420 @@ class TradingBot:
         
         self.db = DatabaseManager(db_filename)
         self.client = RoostooClientV3(
-            api_key=self.API_KEY, 
-            api_secret=self.API_SECRET, 
+            api_key=self.API_KEY,
+            api_secret=self.API_SECRET,
             db_manager=self.db
         )
         self.is_running = True
         self.tasks = []
 
+        # --- Allocator Configuration ---
+        # Tune these during the competition without changing logic.
+        self.cfg = {
+            # Maximum weight any single coin can hold (e.g. 0.30 = 30%)
+            "max_single_coin":   0.30,
+
+            # Minimum cash (USD) reserve as a fraction of portfolio. 
+            # Acts as a drawdown circuit-breaker. Never deploy below this.
+            "min_cash_fraction": 0.20,
+
+            # Don't rebalance a coin unless its weight diff exceeds this.
+            # Reduces turnover. Raise if fees are hurting you.
+            "sticky_threshold":  0.05,
+
+            # Lookback window for volatility calculation (number of 5-min bars).
+            # 288 = 24 hours at 5-min intervals.
+            "vol_lookback":      288,
+
+            # Minimum USD notional for a trade to be sent.
+            # Avoids API rejections and pointless micro-trades.
+            "min_trade_usd":     200.0,
+
+            # Decay factor for exponentially-weighted volatility (0 < λ < 1).
+            # Higher = more weight on recent vol. Set to None for simple std.
+            "ewm_span":          48,
+        }
+
     async def initialize(self):
-        """Warm up the bot: Init DB and check exchange status."""
+        """Warm up: init DB and check exchange status."""
         logger.info("Initializing Database...")
         await self.db.init_db()
-        
         logger.info("Checking Exchange Connection...")
-        is_live, _ = await self.client.handle_get_exchange_info()
-        if not is_live:
-            logger.warning("Exchange is currently NOT running (IsRunning=False).")
+        result = await self.client.handle_get_exchange_info()
+        if result:
+            is_live, _ = result
+            if not is_live:
+                logger.warning("Exchange is NOT running (IsRunning=False).")
+
+    # ==========================================================================
+    #  ALLOCATOR
+    # ==========================================================================
 
     async def run_allocator(self):
         """
-        Portfolio Allocator: 
-        1. Pools pending intents (Convictions).
-        2. Calculates volatility for Risk-Weights.
-        3. Calculates target weights and applies sticky logic.
-        4. Executes required rebalancing trades.
+        Portfolio Allocator — called every execution cycle.
+
+        Pipeline:
+          1. Collect & pool pending conviction signals from strategies.
+          2. Fetch environment: prices, volatility history, current balance.
+          3. Compute target weights via conviction-weighted risk parity.
+          4. Apply cash floor and single-coin cap.
+          5. Apply sticky threshold to suppress low-value rebalances.
+          6. Execute required trades (sells first, then buys).
         """
+        # ------------------------------------------------------------------
+        # STEP 1: Pool Conviction Signals
+        # ------------------------------------------------------------------
         pending_intents = await self.db.get_pending_intents()
         if not pending_intents:
-            return  # No new votes to process
+            return
 
-        # --- STEP 1: Pool Intents (Average Conviction per Coin) ---
-        convictions = {}
+        # Average conviction per coin across all strategies.
+        # conviction is already clamped to [-1, 1] at the DB layer.
+        pooled: Dict[str, list] = {}
         intent_ids = []
         for intent in pending_intents:
-            sym = intent['symbol']
-            if sym not in convictions:
-                convictions[sym] = []
-            
-            # Assuming strategies pass a score [-1, 1] in the 'quantity' or 'price' field.
-            # We will use 'quantity' as the conviction score for this architecture.
-            conviction_score = float(intent['quantity'])
-            
-            # If the strategy sent a SELL intent, make the score negative
-            if intent['side'].upper() == 'SELL':
-                conviction_score = -abs(conviction_score)
-                
-            convictions[sym].append(conviction_score)
+            sym = intent['symbol']           # e.g. 'BTC'
+            pooled.setdefault(sym, []).append(float(intent['conviction']))
             intent_ids.append(intent['id'])
 
-        # Average the pooled intents
-        avg_convictions = {sym: sum(scores)/len(scores) for sym, scores in convictions.items()}
+        avg_convictions: Dict[str, float] = {
+            sym: sum(scores) / len(scores) 
+            for sym, scores in pooled.items()
+        }
+        logger.info(f"Allocator: pooled convictions = {avg_convictions}")
 
-        # Lock intents as processing
+        # Mark as processing immediately so we don't double-process on a slow cycle
         for i_id in intent_ids:
             await self.db.update_intent_status(i_id, "PROCESSING")
 
-        # --- STEP 2: Fetch Environment Data ---
-        pairs_to_fetch = [f"{sym}" for sym in avg_convictions.keys()]
-        history = await self.db.get_tick_history_batch(pairs=pairs_to_fetch, limit=288)
-        
-        # Build price DataFrame for Volatility calculation
-        price_data = {}
-        for pair, ticks in history.items():
-            price_data[sym] = [t['price'] for t in ticks]
-        
-        df_prices = pd.DataFrame(price_data)
+        # ------------------------------------------------------------------
+        # STEP 2: Fetch Environment
+        # ------------------------------------------------------------------
+        # Price history for vol calculation — keys are 'BTC/USD' format
+        pairs_with_usd = [f"{sym}/USD" for sym in avg_convictions.keys()]
+        history = await self.db.get_tick_history_batch(
+            pairs=pairs_with_usd, 
+            limit=self.cfg["vol_lookback"]
+        )
 
-        # Get latest prices for valuation
+        # Build a price DataFrame indexed by pair (strip /USD for clean column names)
+        price_series = {}
+        for pair, ticks in history.items():
+            coin = pair.replace("/USD", "")
+            if len(ticks) >= 2:
+                price_series[coin] = [t['price'] for t in ticks]
+
+        df_prices = pd.DataFrame(price_series) if price_series else pd.DataFrame()
+
+        # Latest prices for valuation and trade sizing
         latest_prices = await self.db.get_latest_price_batch()
 
-        # Get Current Portfolio Weights
-        current_portfolio_value = 0.0
-        current_holdings_usd = {}
-        
-        for asset, qty in self.client.balance.items():
-            qty = float(qty)
+        # Sync balance (use cached value — sync_cycle keeps it fresh)
+        balance = self.client.balance
+        if not balance:
+            logger.warning("Allocator: balance is empty, skipping cycle.")
+            for i_id in intent_ids:
+                await self.db.update_intent_status(i_id, "REJECTED")
+            return
+
+        # ------------------------------------------------------------------
+        # STEP 3: Current Portfolio Valuation
+        # ------------------------------------------------------------------
+        current_holdings_usd: Dict[str, float] = {}
+        total_portfolio_usd = 0.0
+
+        for asset, free_qty in balance.items():
+            free_qty = float(free_qty)
             if asset == 'USD':
-                val = qty
+                val = free_qty
             else:
-                price = float(latest_prices.get(f"{asset}/USD", {}).get('last_price', 0))
-                val = qty * price
-                
+                price = float(latest_prices.get(f"{asset}/USD", {}).get('last_price', 0.0))
+                val = free_qty * price
+
             current_holdings_usd[asset] = val
-            current_portfolio_value += val
-            
-        # Avoid division by zero on fresh accounts
-        if current_portfolio_value == 0:
-            current_portfolio_value = 1.0 
-            
-        current_weights = {k: (v / current_portfolio_value) for k, v in current_holdings_usd.items()}
+            total_portfolio_usd += val
 
-        # --- STEP 3: Calculate Target Portfolio ---
-        target_weights = self._calculate_target_weights(avg_convictions, df_prices)
-        trades_to_execute = self._apply_sticky_logic(target_weights, current_weights)
+        if total_portfolio_usd <= 0:
+            logger.warning("Allocator: portfolio value is zero, skipping.")
+            for i_id in intent_ids:
+                await self.db.update_intent_status(i_id, "REJECTED")
+            return
 
-        # --- STEP 4: Execute Rebalancing Trades ---
-        for coin, target_w in trades_to_execute.items():
-            target_usd = target_w * current_portfolio_value
+        current_weights: Dict[str, float] = {
+            k: v / total_portfolio_usd 
+            for k, v in current_holdings_usd.items()
+        }
+        logger.info(
+            f"Portfolio: ${total_portfolio_usd:,.0f} | "
+            f"Cash: {current_weights.get('USD', 0):.1%}"
+        )
+
+        # ------------------------------------------------------------------
+        # STEP 4: Calculate Target Weights
+        # ------------------------------------------------------------------
+        target_weights = self._calculate_target_weights(
+            avg_convictions, df_prices, latest_prices
+        )
+
+        # ------------------------------------------------------------------
+        # STEP 5: Sticky Filter → Trades to Execute
+        # ------------------------------------------------------------------
+        trades = self._apply_sticky_logic(target_weights, current_weights)
+
+        if not trades:
+            logger.info("Allocator: no rebalances exceed sticky threshold.")
+            for i_id in intent_ids:
+                await self.db.update_intent_status(i_id, "EXECUTED")
+            return
+
+        # ------------------------------------------------------------------
+        # STEP 6: Execute — Sells First (frees up USD), then Buys
+        # ------------------------------------------------------------------
+        sells = {c: w for c, w in trades.items() if w < current_weights.get(c, 0.0)}
+        buys  = {c: w for c, w in trades.items() if w > current_weights.get(c, 0.0)}
+
+        for coin, target_w in {**sells, **buys}.items():
             current_usd = current_holdings_usd.get(coin, 0.0)
-            diff_usd = target_usd - current_usd
-            
-            latest_price = float(latest_prices.get(f"{coin}/USD", {}).get('last_price', 0))
+            target_usd  = target_w * total_portfolio_usd
+            diff_usd    = target_usd - current_usd
+
+            latest_price = float(
+                latest_prices.get(f"{coin}/USD", {}).get('last_price', 0.0)
+            )
             if latest_price <= 0:
+                logger.warning(f"Allocator: no price for {coin}, skipping.")
                 continue
 
-            raw_qty = abs(diff_usd) / latest_price
-            
-            # Apply Exchange Precision & Minimums (Reduces unprofitable micro-trades)
-            rules = self.client.market_rules.get(f"{coin}/USD", {})
-            qty_precision = rules.get("qty_precision", 4)
-            min_qty = rules.get("min_qty", 0.0)
-            
-            # Round down to valid precision
-            trade_qty = np.floor(raw_qty * (10**qty_precision)) / (10**qty_precision)
+            # Notional filter
+            if abs(diff_usd) < self.cfg["min_trade_usd"]:
+                logger.info(
+                    f"Allocator: skipping {coin}, diff ${abs(diff_usd):.0f} "
+                    f"< min ${self.cfg['min_trade_usd']:.0f}"
+                )
+                continue
 
-            if trade_qty < min_qty:
-                logger.info(f"Skipping {coin} rebalance: Qty {trade_qty} below min {min_qty}")
+            # Quantity precision from exchange rules
+            rules        = self.client.market_rules.get(f"{coin}/USD", {})
+            qty_prec     = rules.get("qty_precision", 6)
+            min_notional = rules.get("min_notional", 1.0)
+
+            raw_qty  = abs(diff_usd) / latest_price
+            # Round DOWN to valid precision (never overshoot balance)
+            trade_qty = np.floor(raw_qty * (10 ** qty_prec)) / (10 ** qty_prec)
+
+            # Notional check: qty * price > MiniOrder
+            if trade_qty * latest_price <= min_notional:
+                logger.info(
+                    f"Allocator: skipping {coin}, notional "
+                    f"${trade_qty * latest_price:.2f} <= MiniOrder {min_notional}"
+                )
                 continue
 
             side = "BUY" if diff_usd > 0 else "SELL"
-            
+            logger.info(
+                f"Rebalance {coin}: {side} {trade_qty} @ ~${latest_price:,.2f} "
+                f"(cur {current_weights.get(coin, 0):.1%} → tgt {target_w:.1%})"
+            )
+
             try:
-                logger.info(f"Rebalancing {coin}: {side} {trade_qty} (Target Weight: {target_w:.1%})")
                 await self.client.handle_place_order(
                     symbol=coin,
                     side=side,
                     quantity=trade_qty,
-                    price=None # Market order for rebalancing
+                    price=None  # Market order for rebalancing
                 )
             except Exception as e:
                 logger.error(f"Rebalance execution failed for {coin}: {e}")
 
-        # Mark intents as executed
         for i_id in intent_ids:
             await self.db.update_intent_status(i_id, "EXECUTED")
 
-    # --- ALLOCATOR HELPER FUNCTIONS ---
+    # --------------------------------------------------------------------------
+    # ALLOCATOR HELPERS
+    # --------------------------------------------------------------------------
 
-    def _calculate_target_weights(self, convictions_dict, df_prices, max_single_coin=0.15):
-        if df_prices.empty:
-            return {}
+    def _calculate_target_weights(
+        self,
+        convictions: Dict[str, float],
+        df_prices: pd.DataFrame,
+        latest_prices: Dict[str, Any],
+    ) -> Dict[str, float]:
+        """
+        Converts raw conviction scores into portfolio target weights.
 
-        #If only bearsih signal is there don't trade, hold cash since its long only
-        conviction_series = pd.Series(convictions_dict).clip(lower=0)
-        
-        # 2. Risk Parity Multiplier
-        returns = df_prices.pct_change().dropna()
-        if returns.empty:
-            risk_scalar = pd.Series(1.0, index=df_prices.columns) # Fallback
+        Logic:
+          - Conviction in (0, 1]  → long position, size proportional to conviction
+          - Conviction == 0       → no position (hold cash for this slot)
+          - Conviction in [-1, 0) → no position (long-only; bearish = exit/avoid)
+
+          Weight = conviction (clipped to [0,1]) * inverse_vol_scalar * max_single_coin
+          Then:
+            1. Cap each coin at max_single_coin
+            2. Enforce cash floor (min_cash_fraction)
+            3. Renormalise so crypto weights + cash floor <= 1.0
+        """
+        cfg = self.cfg
+
+        # Long-only: negative convictions become zero (exit / don't enter)
+        conviction_series = pd.Series(convictions).clip(lower=0.0)
+
+        # --- Volatility Scalar ---
+        if not df_prices.empty:
+            # Align df_prices columns to conviction keys
+            available_coins = [c for c in conviction_series.index if c in df_prices.columns]
+            df_sub = df_prices[available_coins]
+            returns = df_sub.pct_change().dropna()
+
+            if len(returns) >= 5:
+                if cfg["ewm_span"]:
+                    # Exponentially weighted vol — more sensitive to recent moves
+                    vol = returns.ewm(span=cfg["ewm_span"], min_periods=5).std().iloc[-1]
+                else:
+                    vol = returns.std()
+
+                inverse_vol = 1.0 / (vol + 1e-9)
+                # Normalise so the average coin gets a scalar of exactly 1.0
+                risk_scalar = inverse_vol / (inverse_vol.mean() + 1e-9)
+            else:
+                risk_scalar = pd.Series(1.0, index=df_sub.columns)
+
+            # Fill any coins with no history with scalar = 1.0
+            risk_scalar = risk_scalar.reindex(conviction_series.index).fillna(1.0)
         else:
-            volatility = returns.std()
-            inverse_vol = 1 / (volatility + 1e-9)
-            # Scale inverse_vol so the "average" coin has a multiplier of exactly 1.0
-            # Low vol coins get > 1.0 multiplier, High vol coins get < 1.0
-            risk_scalar = inverse_vol / inverse_vol.mean()
-        
-        risk_scalar = risk_scalar.reindex(conviction_series.index).fillna(1.0)
+            # No history yet (first few bars) — equal scaling
+            risk_scalar = pd.Series(1.0, index=conviction_series.index)
 
-        # A conviction of 1.0 * avg risk * 15% cap = Exactly 15% portfolio weight
-        #ans scale accordingly
-        target_weights = conviction_series * risk_scalar * max_single_coin
-        
-        target_weights = target_weights.clip(upper=max_single_coin)
-        total_weight = target_weights.sum()
-        if total_weight > 1.0:
-            target_weights = target_weights / total_weight
-            
-        return target_weights.fillna(0).to_dict()
+        # --- Raw Weights ---
+        # conviction=1.0 * avg_risk_scalar * cap = exactly cap weight
+        raw_weights = conviction_series * risk_scalar * cfg["max_single_coin"]
+        raw_weights = raw_weights.clip(upper=cfg["max_single_coin"])
 
-    def _apply_sticky_logic(self, target_weights, current_weights, threshold=0.02):
-        trades_to_execute = {}
-        
-        # Combine all known keys from both target and current portfolios
-        all_coins = set(target_weights.keys()).union(set(current_weights.keys()))
-        all_coins.discard('USD') # Don't trade USD against itself
-        
+        # --- Cash Floor Enforcement ---
+        # Max investable fraction = 1 - cash_floor
+        max_investable = 1.0 - cfg["min_cash_fraction"]
+        total_raw = raw_weights.sum()
+
+        if total_raw > max_investable:
+            # Scale down proportionally to respect the cash floor
+            raw_weights = raw_weights * (max_investable / total_raw)
+
+        target = raw_weights.fillna(0.0).to_dict()
+
+        logger.info(
+            f"Target weights: { {k: f'{v:.1%}' for k, v in target.items()} } "
+            f"| Cash floor: {cfg['min_cash_fraction']:.0%} "
+            f"| Investable: {sum(target.values()):.1%}"
+        )
+        return target
+
+    def _apply_sticky_logic(
+        self,
+        target_weights: Dict[str, float],
+        current_weights: Dict[str, float],
+        threshold: Optional[float] = None
+    ) -> Dict[str, float]:
+        """
+        Returns only the coins that actually need rebalancing.
+        A coin is included if |target - current| > sticky_threshold.
+
+        Also handles exits: if a coin has a current position but no target weight
+        (strategy went silent or turned bearish), it is added as a full exit.
+        """
+        threshold = threshold or self.cfg["sticky_threshold"]
+        trades = {}
+
+        # All coins that are either targeted or currently held
+        all_coins = (
+            set(target_weights.keys()) | 
+            set(k for k in current_weights.keys() if k != 'USD')
+        )
+
         for coin in all_coins:
-            target = target_weights.get(coin, 0.0)
+            target  = target_weights.get(coin, 0.0)
             current = current_weights.get(coin, 0.0)
-            diff = target - current
-            
-            #Rduce turnover
-            if abs(diff) > threshold:
-                trades_to_execute[coin] = target
-                
-        return trades_to_execute
+            diff    = target - current
 
-    # ---------------------------------------------------------
-    # --- CONCURRENT EVENT LOOPS ---
-    # ---------------------------------------------------------
+            if abs(diff) > threshold:
+                trades[coin] = target
+                logger.debug(
+                    f"Sticky: {coin} queued | cur={current:.2%} tgt={target:.2%} diff={diff:+.2%}"
+                )
+
+        return trades
+
+    # ==========================================================================
+    # CONCURRENT EVENT LOOPS
+    # ==========================================================================
 
     async def market_data_cycle(self):
-        """Fetches prices synced precisely to 5-minute clock boundaries."""
+        """Fetches prices synced to 5-minute clock boundaries."""
         while self.is_running:
             try:
                 now = time.time()
-                # Calculate exactly how many seconds until the next 300s (5m) interval
                 sleep_duration = 300 - (now % 300)
-                
-                logger.info(f"Data Cycle: Sleeping {sleep_duration:.1f}s until next 5-min close...")
+                logger.info(f"Data Cycle: sleeping {sleep_duration:.1f}s until next 5-min bar...")
                 await asyncio.sleep(sleep_duration)
-                
+
                 if not self.is_running:
                     break
-                    
-                # Fetch immediately at the exact boundary
+
                 await self.client.handle_get_ticker()
-                logger.info("5-min closing prices updated on Data Bus.")
-                
+                logger.info("5-min prices updated on Data Bus.")
+
             except Exception as e:
                 logger.error(f"Market data cycle error: {e}")
-                await asyncio.sleep(5) # Brief pause on error before retrying
+                await asyncio.sleep(5)
 
     async def execution_cycle(self):
-        """High-frequency loop checking for strategy intents."""
+        """Checks for strategy intents and runs the allocator."""
         while self.is_running:
             try:
                 await self.run_allocator()
-                await asyncio.sleep(5.0) # Check for new intents every 1 second
+                await asyncio.sleep(5.0)
             except Exception as e:
                 logger.error(f"Execution cycle error: {e}")
                 await asyncio.sleep(5.0)
 
     async def sync_cycle(self):
-        """Lower-frequency loop to keep local balance state accurate."""
+        """Keeps local balance and order state accurate."""
         while self.is_running:
             try:
-                await asyncio.sleep(60.0) # Sync every 1 minute
+                await asyncio.sleep(60.0)
                 if not self.is_running:
                     break
                 await self.client.handle_get_balance()
                 await self.client.handle_query_order(pending_only=True)
+                await self.db.prune_ticks(hours_to_keep=48)
             except Exception as e:
                 logger.error(f"Sync cycle error: {e}")
                 await asyncio.sleep(5)
 
     async def start_processes(self):
         """Kicks off all concurrent tasks."""
-        # Do one initial fetch so strategies aren't flying blind for the first 5 minutes
         logger.info("Running initial data fetch...")
         await self.client.handle_get_ticker()
         await self.client.handle_get_balance()
 
-        # Launch the independent loops
         self.tasks = [
             asyncio.create_task(self.market_data_cycle()),
             asyncio.create_task(self.execution_cycle()),
-            asyncio.create_task(self.sync_cycle())
+            asyncio.create_task(self.sync_cycle()),
         ]
-        
-        # Wait for them to finish (which is never, until shutdown)
         await asyncio.gather(*self.tasks)
 
     async def shutdown(self):
         logger.info("Shutting down bot...")
         self.is_running = False
-        
-        # Cancel pending tasks to prevent them from hanging
         for task in self.tasks:
             task.cancel()
-            
         await self.client.close()
         logger.info("Cleanup complete.")
 
+
 async def main():
     bot = TradingBot()
-    
-    # Handle OS signals for graceful exit (Linux/EC2)
+
     if sys.platform != "win32":
         try:
             loop = asyncio.get_running_loop()
@@ -309,15 +458,14 @@ async def main():
         await bot.initialize()
         await bot.start_processes()
     except asyncio.CancelledError:
-        # Expected behavior during shutdown
         pass
     except KeyboardInterrupt:
-        # Fallback for local Windows testing
         logger.info("KeyboardInterrupt received.")
     except Exception as e:
-        logger.critical(f"Fatal error: {e}")
+        logger.critical(f"Fatal error: {e}", exc_info=True)
     finally:
         await bot.shutdown()
+
 
 if __name__ == "__main__":
     asyncio.run(main())
