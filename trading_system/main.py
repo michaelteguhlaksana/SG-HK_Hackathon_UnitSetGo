@@ -171,31 +171,32 @@ class TradingBot:
         if df_prices.empty:
             return {}
 
-        # 1. Long-Only Filter
+        #If only bearsih signal is there don't trade, hold cash since its long only
         conviction_series = pd.Series(convictions_dict).clip(lower=0)
         
-        # 2. Risk-Weights (Inverse Volatility)
+        # 2. Risk Parity Multiplier
         returns = df_prices.pct_change().dropna()
         if returns.empty:
-            volatility = pd.Series(0.01, index=df_prices.columns) # Fallback
+            risk_scalar = pd.Series(1.0, index=df_prices.columns) # Fallback
         else:
             volatility = returns.std()
+            inverse_vol = 1 / (volatility + 1e-9)
+            # Scale inverse_vol so the "average" coin has a multiplier of exactly 1.0
+            # Low vol coins get > 1.0 multiplier, High vol coins get < 1.0
+            risk_scalar = inverse_vol / inverse_vol.mean()
         
-        risk_weights = 1 / (volatility + 1e-9)
-        risk_weights = risk_weights.reindex(conviction_series.index).fillna(0)
-        raw_scores = conviction_series * risk_weights
-        
-        total_score = raw_scores.sum()
-        if total_score == 0:
-            return {coin: 0.0 for coin in conviction_series.index}
+        risk_scalar = risk_scalar.reindex(conviction_series.index).fillna(1.0)
 
-        target_weights = (raw_scores / total_score).fillna(0)
+        # A conviction of 1.0 * avg risk * 15% cap = Exactly 15% portfolio weight
+        #ans scale accordingly
+        target_weights = conviction_series * risk_scalar * max_single_coin
+        
         target_weights = target_weights.clip(upper=max_single_coin)
-        
-        final_weights = (target_weights / target_weights.sum()).fillna(0)
-        
-        # Return as dict {'BTC': 0.15, 'ETH': 0.08}
-        return final_weights.to_dict()
+        total_weight = target_weights.sum()
+        if total_weight > 1.0:
+            target_weights = target_weights / total_weight
+            
+        return target_weights.fillna(0).to_dict()
 
     def _apply_sticky_logic(self, target_weights, current_weights, threshold=0.02):
         trades_to_execute = {}
