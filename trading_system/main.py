@@ -4,6 +4,8 @@ import signal
 import sys
 import json
 import time
+import pandas as pd
+import numpy as np
 from db.db_manager import DatabaseManager
 from gateway.Roostoo import RoostooClientV3
 
@@ -46,31 +48,172 @@ class TradingBot:
             logger.warning("Exchange is currently NOT running (IsRunning=False).")
 
     async def run_allocator(self):
-        """Reads pending intents from strategies and executes them."""
+        """
+        Portfolio Allocator: 
+        1. Pools pending intents (Convictions).
+        2. Calculates volatility for Risk-Weights.
+        3. Calculates target weights and applies sticky logic.
+        4. Executes required rebalancing trades.
+        """
         pending_intents = await self.db.get_pending_intents()
-        
+        if not pending_intents:
+            return  # No new votes to process
+
+        # --- STEP 1: Pool Intents (Average Conviction per Coin) ---
+        convictions = {}
+        intent_ids = []
         for intent in pending_intents:
-            intent_id = intent['id']
-            symbol = intent['symbol']
+            sym = intent['symbol']
+            if sym not in convictions:
+                convictions[sym] = []
+            
+            # Assuming strategies pass a score [-1, 1] in the 'quantity' or 'price' field.
+            # We will use 'quantity' as the conviction score for this architecture.
+            conviction_score = float(intent['quantity'])
+            
+            # If the strategy sent a SELL intent, make the score negative
+            if intent['side'].upper() == 'SELL':
+                conviction_score = -abs(conviction_score)
+                
+            convictions[sym].append(conviction_score)
+            intent_ids.append(intent['id'])
+
+        # Average the pooled intents
+        avg_convictions = {sym: sum(scores)/len(scores) for sym, scores in convictions.items()}
+
+        # Lock intents as processing
+        for i_id in intent_ids:
+            await self.db.update_intent_status(i_id, "PROCESSING")
+
+        # --- STEP 2: Fetch Environment Data ---
+        pairs_to_fetch = [f"{sym}" for sym in avg_convictions.keys()]
+        history = await self.db.get_tick_history_batch(pairs=pairs_to_fetch, limit=288)
+        
+        # Build price DataFrame for Volatility calculation
+        price_data = {}
+        for pair, ticks in history.items():
+            price_data[sym] = [t['price'] for t in ticks]
+        
+        df_prices = pd.DataFrame(price_data)
+
+        # Get latest prices for valuation
+        latest_prices = await self.db.get_latest_price_batch()
+
+        # Get Current Portfolio Weights
+        current_portfolio_value = 0.0
+        current_holdings_usd = {}
+        
+        for asset, qty in self.client.balance.items():
+            qty = float(qty)
+            if asset == 'USD':
+                val = qty
+            else:
+                price = float(latest_prices.get(f"{asset}/USD", {}).get('last_price', 0))
+                val = qty * price
+                
+            current_holdings_usd[asset] = val
+            current_portfolio_value += val
+            
+        # Avoid division by zero on fresh accounts
+        if current_portfolio_value == 0:
+            current_portfolio_value = 1.0 
+            
+        current_weights = {k: (v / current_portfolio_value) for k, v in current_holdings_usd.items()}
+
+        # --- STEP 3: Calculate Target Portfolio ---
+        target_weights = self._calculate_target_weights(avg_convictions, df_prices)
+        trades_to_execute = self._apply_sticky_logic(target_weights, current_weights)
+
+        # --- STEP 4: Execute Rebalancing Trades ---
+        for coin, target_w in trades_to_execute.items():
+            target_usd = target_w * current_portfolio_value
+            current_usd = current_holdings_usd.get(coin, 0.0)
+            diff_usd = target_usd - current_usd
+            
+            latest_price = float(latest_prices.get(f"{coin}/USD", {}).get('last_price', 0))
+            if latest_price <= 0:
+                continue
+
+            raw_qty = abs(diff_usd) / latest_price
+            
+            # Apply Exchange Precision & Minimums (Reduces unprofitable micro-trades)
+            rules = self.client.market_rules.get(f"{coin}/USD", {})
+            qty_precision = rules.get("qty_precision", 4)
+            min_qty = rules.get("min_qty", 0.0)
+            
+            # Round down to valid precision
+            trade_qty = np.floor(raw_qty * (10**qty_precision)) / (10**qty_precision)
+
+            if trade_qty < min_qty:
+                logger.info(f"Skipping {coin} rebalance: Qty {trade_qty} below min {min_qty}")
+                continue
+
+            side = "BUY" if diff_usd > 0 else "SELL"
             
             try:
-                await self.db.update_intent_status(intent_id, "PROCESSING")
-                logger.info(f"Master executing intent from {intent['strategy_name']}: {intent['side']} {intent['quantity']} {symbol}")
-                
+                logger.info(f"Rebalancing {coin}: {side} {trade_qty} (Target Weight: {target_w:.1%})")
                 await self.client.handle_place_order(
-                    symbol=symbol,
-                    side=intent['side'],
-                    quantity=intent['quantity'],
-                    price=intent.get('price')
+                    symbol=coin,
+                    side=side,
+                    quantity=trade_qty,
+                    price=None # Market order for rebalancing
                 )
-                
-                # Mark as processed on success
-                await self.db.update_intent_status(intent_id, "EXECUTED")
-                
             except Exception as e:
-                logger.error(f"Failed to execute intent {intent_id}: {e}")
-                # Mark as FAILED so we can audit later without infinite retries
-                await self.db.update_intent_status(intent_id, "FAILED")
+                logger.error(f"Rebalance execution failed for {coin}: {e}")
+
+        # Mark intents as executed
+        for i_id in intent_ids:
+            await self.db.update_intent_status(i_id, "EXECUTED")
+
+    # --- ALLOCATOR HELPER FUNCTIONS ---
+
+    def _calculate_target_weights(self, convictions_dict, df_prices, max_single_coin=0.15):
+        if df_prices.empty:
+            return {}
+
+        # 1. Long-Only Filter
+        conviction_series = pd.Series(convictions_dict).clip(lower=0)
+        
+        # 2. Risk-Weights (Inverse Volatility)
+        returns = df_prices.pct_change().dropna()
+        if returns.empty:
+            volatility = pd.Series(0.01, index=df_prices.columns) # Fallback
+        else:
+            volatility = returns.std()
+        
+        risk_weights = 1 / (volatility + 1e-9)
+        risk_weights = risk_weights.reindex(conviction_series.index).fillna(0)
+        raw_scores = conviction_series * risk_weights
+        
+        total_score = raw_scores.sum()
+        if total_score == 0:
+            return {coin: 0.0 for coin in conviction_series.index}
+
+        target_weights = (raw_scores / total_score).fillna(0)
+        target_weights = target_weights.clip(upper=max_single_coin)
+        
+        final_weights = (target_weights / target_weights.sum()).fillna(0)
+        
+        # Return as dict {'BTC': 0.15, 'ETH': 0.08}
+        return final_weights.to_dict()
+
+    def _apply_sticky_logic(self, target_weights, current_weights, threshold=0.02):
+        trades_to_execute = {}
+        
+        # Combine all known keys from both target and current portfolios
+        all_coins = set(target_weights.keys()).union(set(current_weights.keys()))
+        all_coins.discard('USD') # Don't trade USD against itself
+        
+        for coin in all_coins:
+            target = target_weights.get(coin, 0.0)
+            current = current_weights.get(coin, 0.0)
+            diff = target - current
+            
+            #Rduce turnover
+            if abs(diff) > threshold:
+                trades_to_execute[coin] = target
+                
+        return trades_to_execute
 
     # ---------------------------------------------------------
     # --- CONCURRENT EVENT LOOPS ---
