@@ -38,7 +38,6 @@ class DatabaseManager:
             """)
             
             # 3. Create Tickers Table (Latest State - The "Data Bus")
-            # This allows strategies to get the current price without scanning history.
             await db.execute("""
                 CREATE TABLE IF NOT EXISTS tickers (
                     pair TEXT PRIMARY KEY,
@@ -49,7 +48,6 @@ class DatabaseManager:
             """)
 
             # 4. Create Ticks Table (Historical Log)
-            # We use a composite primary key to prevent duplicate entries if the API is polled twice in 1ms.
             await db.execute("""
                 CREATE TABLE IF NOT EXISTS ticks (
                     pair TEXT,
@@ -63,23 +61,25 @@ class DatabaseManager:
             # 5. Index for fast strategy lookback
             await db.execute("CREATE INDEX IF NOT EXISTS idx_tick_lookup ON ticks (pair, timestamp DESC);")
             
-            # 6. Order Intents Table (The Bridge between Strategy and Master)
+            # 6. Order Intents Table
+            # NOTE: 'conviction' is a float in [-1.0, 1.0].
+            #   +1.0 = maximum bullish, -1.0 = maximum bearish, 0.0 = no view.
+            # Strategies must submit a conviction score, NOT a raw quantity.
             await db.execute("""
                 CREATE TABLE IF NOT EXISTS order_intents (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     strategy_name TEXT,
                     symbol TEXT,
-                    side TEXT,
-                    quantity REAL,
-                    price REAL,
+                    conviction REAL,
                     status TEXT DEFAULT 'PENDING',
                     timestamp INTEGER
                 )
             """)
             await db.commit()
-            logger.info("Database initialized: Tick history enabled.")
+            logger.info("Database initialized.")
 
     # --- Order Methods ---
+
     async def save_order(self, order: Dict[str, Any]):
         """Saves or updates an order status."""
         async with aiosqlite.connect(self.db_path) as db:
@@ -109,7 +109,7 @@ class DatabaseManager:
     async def update_tickers_batch(self, ticker_data_list: List[Dict[str, Any]]):
         """
         Updates multiple tickers in a single transaction.
-        ticker_data_list should be a list of dicts: [{'pair': 'BTC/USD', 'price': 9000.0, 'volume': 1000.0}, ...]
+        ticker_data_list: [{'pair': 'BTC/USD', 'price': 9000.0, 'volume': 1000.0}, ...]
         """
         ts = int(time.time() * 1000)
         async with aiosqlite.connect(self.db_path) as db:
@@ -132,19 +132,25 @@ class DatabaseManager:
             
             await db.commit()
 
+    # --- Intent Methods ---
+
     async def save_order_intent(self, intent: Dict[str, Any]):
-        """Called by a Strategy to request a trade."""
+        """
+        Called by a Strategy to submit a conviction score.
+        intent must contain: 'name', 'symbol', 'conviction' (float in [-1, 1])
+        """
         ts = int(time.time() * 1000)
+        # Hard clamp at DB layer as a safety net
+        conviction = max(-1.0, min(1.0, float(intent['conviction'])))
         async with aiosqlite.connect(self.db_path) as db:
             await db.execute("""
-                INSERT INTO order_intents (strategy_name, symbol, side, quantity, price, timestamp)
-                VALUES (?, ?, ?, ?, ?, ?)
-            """, (intent['name'], intent['symbol'], intent['side'], 
-                intent['quantity'], intent['price'], ts))
+                INSERT INTO order_intents (strategy_name, symbol, conviction, timestamp)
+                VALUES (?, ?, ?, ?)
+            """, (intent['name'], intent['symbol'].upper(), conviction, ts))
             await db.commit()
 
     async def get_pending_intents(self) -> List[Dict]:
-        """Called by the Master Allocator to see what needs to be executed."""
+        """Called by the Master Allocator to collect unprocessed signals."""
         async with aiosqlite.connect(self.db_path) as db:
             db.row_factory = aiosqlite.Row
             async with db.execute("SELECT * FROM order_intents WHERE status = 'PENDING'") as cursor:
@@ -154,43 +160,21 @@ class DatabaseManager:
     async def update_intent_status(self, intent_id: int, status: str):
         """Marks an intent as 'EXECUTED', 'REJECTED', or 'CANCELLED'."""
         async with aiosqlite.connect(self.db_path) as db:
-            await db.execute("UPDATE order_intents SET status = ? WHERE id = ?", (status, intent_id))
+            await db.execute(
+                "UPDATE order_intents SET status = ? WHERE id = ?", 
+                (status, intent_id)
+            )
             await db.commit()
 
-    # --- Price Methods (Real-time & History) ---
-    async def update_ticker(self, pair: str, price: float, volume: float = 0.0):
-        """
-        Updates the current price and logs it to history.
-        Called by _parse_ticker_price.
-        """
-        ts = int(time.time() * 1000)
-        async with aiosqlite.connect(self.db_path) as db:
-            # We do both in one transaction for speed
-            async with db.cursor() as cursor:
-                # 1. Update the "Live" state
-                await cursor.execute("""
-                    INSERT INTO tickers (pair, last_price, last_volume, timestamp)
-                    VALUES (?, ?, ?, ?)
-                    ON CONFLICT(pair) DO UPDATE SET 
-                        last_price=excluded.last_price,
-                        last_volume=excluded.last_volume,
-                        timestamp=excluded.timestamp
-                """, (pair, price, volume, ts))
-
-                # 2. Append to the "Historical" log
-                await cursor.execute("""
-                    INSERT INTO ticks (pair, price, volume, timestamp)
-                    VALUES (?, ?, ?, ?)
-                    ON CONFLICT(pair, timestamp) DO NOTHING
-                """, (pair, price, volume, ts))
-            
-            await db.commit()
+    # --- Price Methods ---
 
     async def get_latest_price(self, pair: str) -> Dict[str, Any]:
         """Fetch the current market state for a pair."""
         async with aiosqlite.connect(self.db_path) as db:
             db.row_factory = aiosqlite.Row
-            async with db.execute("SELECT * FROM tickers WHERE pair = ?", (pair,)) as cursor:
+            async with db.execute(
+                "SELECT * FROM tickers WHERE pair = ?", (pair,)
+            ) as cursor:
                 row = await cursor.fetchone()
                 return dict(row) if row else {"last_price": 0.0, "last_volume": 0.0, "timestamp": 0}
             
@@ -203,7 +187,6 @@ class DatabaseManager:
             db.row_factory = aiosqlite.Row
             
             if pairs:
-                # SQLite doesn't support binding lists directly, so we build the placeholders
                 placeholders = ','.join(['?'] * len(pairs))
                 query = f"SELECT * FROM tickers WHERE pair IN ({placeholders})"
                 params = pairs
@@ -213,14 +196,12 @@ class DatabaseManager:
 
             async with db.execute(query, params) as cursor:
                 rows = await cursor.fetchall()
-                # Return as { 'BTC/USD': { 'last_price': 9000, ... }, ... }
                 return {row['pair']: dict(row) for row in rows}
 
-    # --- Historical Methods ---
     async def get_tick_history(self, pair: str, limit: int = 100) -> List[Dict]:
         """
-        Returns the last N historical ticks for a pair.
-        Sorted from OLDEST to NEWEST.
+        Returns the last N historical ticks for a single pair.
+        Sorted OLDEST to NEWEST.
         """
         async with aiosqlite.connect(self.db_path) as db:
             db.row_factory = aiosqlite.Row
@@ -233,6 +214,67 @@ class DatabaseManager:
             """, (pair, limit)) as cursor:
                 rows = await cursor.fetchall()
                 return [dict(row) for row in rows][::-1]
+
+    async def get_tick_history_batch(
+        self, 
+        pairs: Optional[List[str]] = None, 
+        limit: int = 100
+    ) -> Dict[str, List[Dict]]:
+        """
+        Returns the last N historical ticks for multiple pairs in one DB round-trip.
+        Returns: { 'BTC/USD': [ {timestamp, price, volume}, ... oldest→newest ], ... }
+
+        Strategy: fetch limit*len(pairs) rows with ROW_NUMBER filtering.
+        Falls back to fetching all pairs if pairs=None.
+        """
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+
+            if pairs:
+                placeholders = ','.join(['?'] * len(pairs))
+                # Use a subquery with ROW_NUMBER to get the last N per pair efficiently
+                query = f"""
+                    SELECT pair, timestamp, price, volume
+                    FROM (
+                        SELECT 
+                            pair, timestamp, price, volume,
+                            ROW_NUMBER() OVER (PARTITION BY pair ORDER BY timestamp DESC) as rn
+                        FROM ticks
+                        WHERE pair IN ({placeholders})
+                    )
+                    WHERE rn <= ?
+                    ORDER BY pair, timestamp ASC
+                """
+                params = pairs + [limit]
+            else:
+                query = """
+                    SELECT pair, timestamp, price, volume
+                    FROM (
+                        SELECT 
+                            pair, timestamp, price, volume,
+                            ROW_NUMBER() OVER (PARTITION BY pair ORDER BY timestamp DESC) as rn
+                        FROM ticks
+                    )
+                    WHERE rn <= ?
+                    ORDER BY pair, timestamp ASC
+                """
+                params = [limit]
+
+            async with db.execute(query, params) as cursor:
+                rows = await cursor.fetchall()
+
+            # Group into dict, already sorted ASC (oldest → newest) by query
+            result: Dict[str, List[Dict]] = {}
+            for row in rows:
+                p = row['pair']
+                if p not in result:
+                    result[p] = []
+                result[p].append({
+                    'timestamp': row['timestamp'],
+                    'price': row['price'],
+                    'volume': row['volume']
+                })
+            return result
 
     async def prune_ticks(self, hours_to_keep: int = 48):
         """Cleans up old ticks to save space and maintain query speed."""
