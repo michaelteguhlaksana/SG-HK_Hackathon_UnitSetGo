@@ -1,0 +1,10 @@
+{
+    "strategy":      "MACD",
+    "name":          "MACD_15m_6h",
+    "symbols":       ["BTC",  "ETH",  "SOL",  "XRP",  "BNB",  "DOGE",  "ZEC",  "SUI",  "ASTER",  "ADA",  "PEPE",  "AVAX",  "LINK",  "ENA",  "PUMP",  "LTC",  "TRX",  "XPL",  "PAXG",  "NEAR"],
+    "resample_tf":   "15min",
+    "window":        24,
+    "poll_interval": 900.0,
+    "db_path":       "./trading_system/database.db",
+    "log_level":     "INFO"
+}

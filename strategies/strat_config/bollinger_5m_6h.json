@@ -1,0 +1,10 @@
+{
+    "strategy":      "Bollinger",
+    "name":          "Bollinger_5m_6h",
+    "symbols":       ["BTC",  "ETH",  "SOL",  "XRP",  "BNB",  "DOGE",  "ZEC",  "SUI",  "ASTER",  "ADA",  "PEPE",  "AVAX",  "LINK",  "ENA",  "PUMP",  "LTC",  "TRX",  "XPL",  "PAXG",  "NEAR"],
+    "resample_tf":   "5min",
+    "window":        72,
+    "poll_interval": 300.0,
+    "db_path":       "./trading_system/database.db",
+    "log_level":     "INFO"
+}

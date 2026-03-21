@@ -1,0 +1,10 @@
+{
+    "strategy":      "XSMom",
+    "name":          "XSMom_1h_24h",
+    "symbols":       ["BTC",  "ETH",  "SOL",  "XRP",  "BNB",  "DOGE",  "ZEC",  "SUI",  "ASTER",  "ADA",  "PEPE",  "AVAX",  "LINK",  "ENA",  "PUMP",  "LTC",  "TRX",  "XPL",  "PAXG",  "NEAR"],
+    "resample_tf":   "1h",
+    "window":        24,
+    "poll_interval": 3600.0,
+    "db_path":       "./trading_system/database.db",
+    "log_level":     "INFO"
+}
