@@ -47,11 +47,11 @@ class TradingBot:
 
             # Minimum cash (USD) reserve as a fraction of portfolio. 
             # Acts as a drawdown circuit-breaker. Never deploy below this.
-            "min_cash_fraction": 0.20,
+            "min_cash_fraction": 0.10,
 
             # Don't rebalance a coin unless its weight diff exceeds this.
             # Reduces turnover. Raise if fees are hurting you.
-            "sticky_threshold":  0.05,
+            "sticky_threshold":  0.10,
 
             # Lookback window for volatility calculation (number of 5-min bars).
             # 288 = 24 hours at 5-min intervals.
@@ -59,7 +59,7 @@ class TradingBot:
 
             # Minimum USD notional for a trade to be sent.
             # Avoids API rejections and pointless micro-trades.
-            "min_trade_usd":     200.0,
+            "min_trade_usd":     5000.0,
 
             # Decay factor for exponentially-weighted volatility (0 < λ < 1).
             # Higher = more weight on recent vol. Set to None for simple std.
@@ -68,17 +68,10 @@ class TradingBot:
             # Per-strategy conviction weights.
             # Strategies not listed here default to 1.0.
             #
-            # Rationale:
-            #   MACD_1h_6h:   strongest post-cost evidence (Sortino 26 in backtest)
-            #   XSMom_1h_24h: low turnover, independent signal, complements MACD
-            #   MACD_15m_6h:  fires 3x more often than 1h so downweighted to
-            #                 prevent it dominating the pool by submission frequency
-            #   Bollinger:    not listed = defaults to 1.0 if accidentally running,
-            #                 but should not be running on the competition account
             "strategy_weights": {
                 "MACD_1h_6h":    3.0,
                 "XSMom_1h_24h":  3.0,
-                "MACD_15m_6h":   1.0,
+                "MACD_15m_6h":   1.0, #Curently not used due to high turnover
             },
         }
 
