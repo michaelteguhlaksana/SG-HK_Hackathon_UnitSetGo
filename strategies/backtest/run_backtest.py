@@ -1,26 +1,46 @@
 '''
-run_backtest.py — entry point for backtesting strategies.
+run_backtest.py — parallel grid-search backtester.
 
-Accepts a single pivoted CSV where:
-  - rows    = timestamps
-  - columns = coin symbols (e.g. BTCUSDT, ETHUSDT, ...)
-  - values  = close prices
+Architecture:
+  - Main process loads the CSV once and builds the price_data dict.
+  - Each worker process receives a single (strategy_config, allocator_cfg) job,
+    runs a full independent backtest with its own temp SQLite file, and returns
+    the metrics dict.
+  - Workers use asyncio internally (each worker has its own event loop).
+  - ProcessPoolExecutor parallelises across CPU cores.
+
+Why not thread-based: asyncio + aiosqlite is already async, but the GIL means
+threads won't give true parallelism for CPU-bound work. Processes do.
 
 @ MTL 21 March 2026
 '''
 import asyncio
 import logging
+import os
+import sys
+import tempfile
+import time
+import itertools
+import concurrent.futures
+from typing import Dict, List, Any
+
 import pandas as pd
 import numpy as np
-import sys
-import os
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# ---------------------------------------------------------------------------
+# Path setup — works when run from SGHK_Hackathon/ root or from strategies/
+# ---------------------------------------------------------------------------
+_FILE_DIR    = os.path.dirname(os.path.abspath(__file__))
+_STRAT_ROOT  = os.path.join(_FILE_DIR, '..')         # strategies/
+_REPO_ROOT   = os.path.join(_FILE_DIR, '..', '..')   # SGHK_Hackathon/
+for p in [_REPO_ROOT, _STRAT_ROOT]:
+    if p not in sys.path:
+        sys.path.insert(0, os.path.normpath(p))
 
-from backtest_engine import BacktestEngine
-from mock_broker import MockBroker
+from backtest.backtest_engine import BacktestEngine
+from backtest.mock_broker import MockBroker
 from trading_system.db.db_manager import DatabaseManager
-from strategies import (
+from strategies.technical_indicator import (
     BollingerReversion,
     MACDStrategy,
     VWAPReversion,
@@ -28,253 +48,422 @@ from strategies import (
     AdaptiveRSI,
 )
 
+# ---------------------------------------------------------------------------
+# Logging — workers log to stdout with their PID so output is distinguishable
+# ---------------------------------------------------------------------------
 logging.basicConfig(
     level=logging.WARNING,
-    format='%(asctime)s [%(levelname)s] %(name)s: %(message)s'
+    format='%(asctime)s [%(levelname)s][%(process)d] %(name)s: %(message)s'
 )
 logger = logging.getLogger("Runner")
 
 
 # ==============================================================================
-# DATA LOADING
+# SYMBOL MAP
 # ==============================================================================
-
-# Binance symbol -> Roostoo pair format
-# Extend this if you have symbols not listed here
 SYMBOL_MAP = {
-    "BTCUSDT":   "BTC/USD",
-    "ETHUSDT":   "ETH/USD",
-    "SOLUSDT":   "SOL/USD",
-    "XRPUSDT":   "XRP/USD",
-    "BNBUSDT":   "BNB/USD",
-    "DOGEUSDT":  "DOGE/USD",
-    "ZECUSDT":   "ZEC/USD",
-    "SUIUSDT":   "SUI/USD",
-    "ASTERUSDT": "ASTER/USD",
-    "ADAUSDT":   "ADA/USD",
-    "PEPEUSDT":  "PEPE/USD",
-    "AVAXUSDT":  "AVAX/USD",
-    "LINKUSDT":  "LINK/USD",
-    "ENAUSDT":   "ENA/USD",
-    "PUMPUSDT":  "PUMP/USD",
-    "LTCUSDT":   "LTC/USD",
-    "TRXUSDT":   "TRX/USD",
-    "XPLUSDT":   "XPL/USD",
-    "PAXGUSDT":  "PAXG/USD",
-    "NEARUSDT":  "NEAR/USD",
+    "BTCUSDT":   "BTC/USD",  "ETHUSDT":   "ETH/USD",  "SOLUSDT":   "SOL/USD",
+    "XRPUSDT":   "XRP/USD",  "BNBUSDT":   "BNB/USD",  "DOGEUSDT":  "DOGE/USD",
+    "ZECUSDT":   "ZEC/USD",  "SUIUSDT":   "SUI/USD",  "ASTERUSDT": "ASTER/USD",
+    "ADAUSDT":   "ADA/USD",  "PEPEUSDT":  "PEPE/USD", "AVAXUSDT":  "AVAX/USD",
+    "LINKUSDT":  "LINK/USD", "ENAUSDT":   "ENA/USD",  "PUMPUSDT":  "PUMP/USD",
+    "LTCUSDT":   "LTC/USD",  "TRXUSDT":   "TRX/USD",  "XPLUSDT":   "XPL/USD",
+    "PAXGUSDT":  "PAXG/USD", "NEARUSDT":  "NEAR/USD",
 }
 
 
+# ==============================================================================
+# DATA LOADING  (runs once in main process only)
+# ==============================================================================
 def load_pivoted_csv(
     csv_path: str,
-    symbols: list = None,
+    symbols: List[str] = None,
     resample_tf: str = None,
-) -> dict:
+    start_date: str = None,
+) -> Dict[str, pd.DataFrame]:
     """
-    Load a pivoted close-price CSV into the dict format the engine expects.
-
-    Args:
-        csv_path:    Path to CSV. Rows=timestamps, columns=symbols.
-        symbols:     Optional list of Binance symbols to include, e.g.
-                     ['BTCUSDT', 'ETHUSDT']. If None, loads all columns.
-        resample_tf: Optional pandas offset string to resample, e.g. '15min',
-                     '1h'. If None, uses the native bar frequency (5min).
-
-    Returns:
-        { 'BTC/USD': DataFrame(timestamp, open, high, low, close, volume), ... }
+    Load pivoted close-price CSV → { 'BTC/USD': DataFrame, ... }
+    start_date: e.g. '2023-01-01' to slice for faster iteration.
     """
-    # --- Load ---
     df = pd.read_csv(csv_path)
 
-    # Handle the index/timestamp column however it arrives
-    if 'timestamp' in df.columns:
-        df['timestamp'] = pd.to_datetime(df['timestamp'], utc=True)
-        df = df.set_index('timestamp')
-    elif 'index' in df.columns:
-        df['index'] = pd.to_datetime(df['index'], utc=True)
-        df = df.set_index('index')
+    # Normalise timestamp index
+    ts_col = next((c for c in ['timestamp', 'index'] if c in df.columns), None)
+    if ts_col:
+        df[ts_col] = pd.to_datetime(df[ts_col], utc=True)
+        df = df.set_index(ts_col)
     else:
-        # Assume first column is the timestamp
         df.index = pd.to_datetime(df.iloc[:, 0], utc=True)
         df = df.iloc[:, 1:]
 
     df = df.sort_index().dropna(how='all')
 
-    # --- Filter symbols ---
+    if start_date:
+        df = df[df.index >= pd.Timestamp(start_date, tz='UTC')]
+
     if symbols:
-        missing = [s for s in symbols if s not in df.columns]
-        if missing:
-            logger.warning(f"Symbols not found in CSV, skipping: {missing}")
         df = df[[s for s in symbols if s in df.columns]]
 
-    # --- Resample ---
     if resample_tf:
         df = df.resample(resample_tf).last().dropna(how='all')
-        logger.warning(f"Resampled to {resample_tf}: {len(df)} bars")
 
-    # --- Convert to Unix ms integer timestamps ---
     timestamps_ms = (df.index.astype('int64') // 1_000_000).tolist()
 
-    # --- Build per-pair DataFrames ---
     price_data = {}
     for col in df.columns:
-        pair = SYMBOL_MAP.get(col)
-        if pair is None:
-            # Auto-derive: strip USDT/BUSD suffix
-            base = col.replace('USDT', '').replace('BUSD', '')
-            pair = f"{base}/USD"
-            logger.warning(f"'{col}' not in SYMBOL_MAP, mapped to '{pair}'")
-
+        pair   = SYMBOL_MAP.get(col, f"{col.replace('USDT','').replace('BUSD','')}/USD")
         prices = df[col].values.tolist()
-
-        # We only have close prices — use close for open/high/low too.
-        # Engine and strategies only use 'close' and 'volume'.
         pair_df = pd.DataFrame({
             "timestamp": timestamps_ms,
-            "open":      prices,
-            "high":      prices,
-            "low":       prices,
-            "close":     prices,
-            "volume":    [0.0] * len(prices),
-        })
+            "open": prices, "high": prices,
+            "low":  prices, "close": prices,
+            "volume": [0.0] * len(prices),
+        }).dropna(subset=["close"])
         price_data[pair] = pair_df
 
     logger.warning(
-        f"Loaded {len(price_data)} pairs, {len(df)} bars each "
-        f"({df.index[0]} -> {df.index[-1]})"
+        f"Loaded {len(price_data)} pairs × {len(df)} bars "
+        f"({df.index[0].date()} → {df.index[-1].date()})"
     )
     return price_data
 
 
-def load_sample_data() -> dict:
-    """Synthetic GBM data for smoke-testing when no CSV is available."""
+def load_sample_data() -> Dict[str, pd.DataFrame]:
     np.random.seed(42)
-    n     = 2000
-    start = 1_700_000_000_000
-    step  = 300_000
+    n, start, step = 2000, 1_700_000_000_000, 300_000
+    def gbm(p0, drift=2e-5, vol=2e-3):
+        px = p0 * np.exp(np.cumsum(np.random.normal(drift, vol, n)))
+        ts = [start + i * step for i in range(n)]
+        return pd.DataFrame({"timestamp":ts,"open":px,"high":px,"low":px,"close":px,"volume":0.0})
+    return {"BTC/USD": gbm(42000), "ETH/USD": gbm(2500,3e-5), "BNB/USD": gbm(300,-1e-5,3e-3)}
 
-    def make_series(start_price, drift=0.00002, vol=0.002):
-        returns = np.random.normal(drift, vol, n)
-        prices  = start_price * np.exp(np.cumsum(returns))
-        ts      = [start + i * step for i in range(n)]
-        return pd.DataFrame({
-            "timestamp": ts,
-            "open": prices, "high": prices, "low": prices,
-            "close": prices, "volume": [0.0] * n,
+
+# ==============================================================================
+# WORKER  (runs in a subprocess — must be importable at module level)
+# ==============================================================================
+def _worker(job: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    A single backtest job. Receives everything it needs as a plain dict
+    (no lambdas, no DB connections — those can't be pickled across processes).
+
+    job keys:
+        price_data      dict of DataFrames (pickled by multiprocessing)
+        strategy_cfgs   list of dicts describing which strategies to run
+        allocator_cfg   dict
+        initial_cash    float
+        label           str   human-readable name for this run
+    """
+    # Each worker needs its own event loop
+    return asyncio.run(_worker_async(job))
+
+
+async def _worker_async(job: Dict[str, Any]) -> Dict[str, Any]:
+    price_data    = job["price_data"]
+    strategy_cfgs = job["strategy_cfgs"]
+    allocator_cfg = job["allocator_cfg"]
+    label         = job["label"]
+
+    # Temp file DB — each worker is fully isolated
+    tmp      = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+    db_path  = tmp.name
+    tmp.close()
+
+    try:
+        bt_db = DatabaseManager(db_path)
+        await bt_db.init_db()
+
+        symbols = [pair.replace("/USD", "") for pair in price_data.keys()]
+
+        # Build strategy instances from config dicts
+        strategies = []
+        for cfg in strategy_cfgs:
+            strat = _build_strategy(cfg, symbols, db_path)
+            strat.db = bt_db
+            strategies.append(strat)
+        print("Starting backtest for:", strategy_cfgs)
+        engine        = BacktestEngine(price_data=price_data, initial_cash=job["initial_cash"], cfg=allocator_cfg)
+        engine.db     = bt_db
+        engine.broker = MockBroker(job["initial_cash"], price_data)
+
+        warmup = max(s.lookback for s in strategies)
+        t0     = time.time()
+        result = await engine.run(strategies, warmup_bars=warmup)
+        elapsed = time.time() - t0
+        print("Finished backtest for:", strategy_cfgs)
+        result["label"]       = label
+        result["elapsed_s"]   = round(elapsed, 1)
+        result["strategy_cfgs"] = strategy_cfgs
+        return result
+
+    finally:
+        try:
+            os.unlink(db_path)
+        except OSError:
+            pass
+
+
+def _build_strategy(cfg: Dict, symbols: List[str], db_path: str):
+    """Instantiate a strategy from a plain config dict."""
+    kind        = cfg["kind"]
+    name        = cfg.get("name", kind)
+    resample_tf = cfg.get("resample_tf", None)
+
+    if kind == "MACD":
+        return MACDStrategy(
+            name, symbols,
+            window=cfg.get("window", 26),
+            db_path=db_path,
+            resample_tf=resample_tf,
+        )
+    elif kind == "Bollinger":
+        return BollingerReversion(
+            name, symbols,
+            window=cfg.get("window", 20),
+            db_path=db_path,
+            resample_tf=resample_tf,
+        )
+    elif kind == "VWAP":
+        return VWAPReversion(
+            name, symbols,
+            window=cfg.get("window", 14),
+            db_path=db_path,
+            resample_tf=resample_tf,
+        )
+    elif kind == "XSMom":
+        return CrossSectionalMomentum(
+            name, symbols,
+            window=cfg.get("window", 24),
+            db_path=db_path,
+            resample_tf=resample_tf,
+        )
+    elif kind == "AdaptRSI":
+        return AdaptiveRSI(
+            name, symbols,
+            rsi_window=cfg.get("rsi_window", 14),
+            percentile_window=cfg.get("percentile_window", 100),
+            db_path=db_path,
+            resample_tf=resample_tf,
+        )
+    else:
+        raise ValueError(f"Unknown strategy kind: {kind}")
+
+
+# ==============================================================================
+# JOB BUILDER  (define your grid here)
+# ==============================================================================
+def build_jobs(price_data: Dict, allocator_cfg: Dict, initial_cash: float) -> List[Dict]:
+    """
+    Returns a list of job dicts to run in parallel.
+    Each job is one complete backtest — a specific combination of strategies,
+    parameters, and timeframes. Edit this function to define your search space.
+
+    resample_tf in a strategy config resamples the DB ticks before on_tick
+    is called. window is always in RESAMPLED bars:
+        window=6, resample_tf='1h'   → 6-hour lookback
+        window=6, resample_tf='15min' → 90-minute lookback
+    """
+    jobs = []
+
+    def job(label, *strategy_cfgs, alloc_cfg=None):
+        return {
+            "price_data":    price_data,
+            "allocator_cfg": alloc_cfg or allocator_cfg,
+            "initial_cash":  initial_cash,
+            "label":         label,
+            "strategy_cfgs": list(strategy_cfgs),
+        }
+
+    # --------------------------------------------------------------------------
+    # Grid 1: MACD — window × timeframe sweep
+    # Replicates your standalone backtest results and extends them.
+    # --------------------------------------------------------------------------
+    for tf, windows in [
+        ('5min',  [6, 12, 24, 48]),
+        ('15min', [6, 12, 24, 48]),
+        ('1h',    [6, 12, 24]),
+    ]:
+        for w in windows:
+            name = f"MACD_w{w}_{tf}"
+            jobs.append(job(
+                name,
+                {"kind": "MACD", "name": name, "window": w, "resample_tf": tf},
+            ))
+
+    # --------------------------------------------------------------------------
+    # Grid 2: Bollinger — window × timeframe sweep
+    # --------------------------------------------------------------------------
+    for tf, windows in [
+        ('15min', [12, 24, 48]),
+        ('1h',    [6, 12, 24]),
+    ]:
+        for w in windows:
+            name = f"Boll_w{w}_{tf}"
+            jobs.append(job(
+                name,
+                {"kind": "Bollinger", "name": name, "window": w, "resample_tf": tf},
+            ))
+
+    # --------------------------------------------------------------------------
+    # Grid 3: XSMom — window × timeframe sweep
+    # --------------------------------------------------------------------------
+    for tf, windows in [
+        ('15min', [6, 12, 24]),
+        ('1h',    [6, 12, 24]),
+    ]:
+        for w in windows:
+            name = f"XSMom_w{w}_{tf}"
+            jobs.append(job(
+                name,
+                {"kind": "XSMom", "name": name, "window": w, "resample_tf": tf},
+            ))
+
+    # --------------------------------------------------------------------------
+    # Grid 4: Best known combo from your prior backtest + timeframe variants
+    # MACD 15min (fast=24, slow=18 → window≈24) was your raw-return winner.
+    # --------------------------------------------------------------------------
+    for mw, mtf, xw, xtf in [
+        (24, '15min', 24, '15min'),   # your prior best
+        (6,  '1h',   24, '15min'),    # MACD slower + XSMom faster
+        (6,  '1h',   6,  '1h'),       # both on 1h
+        (12, '15min', 12, '15min'),
+    ]:
+        label = f"MACD_w{mw}_{mtf}+XSMom_w{xw}_{xtf}"
+        jobs.append(job(
+            label,
+            {"kind": "MACD",  "name": f"MACD_{mw}_{mtf}",  "window": mw, "resample_tf": mtf},
+            {"kind": "XSMom", "name": f"XSMom_{xw}_{xtf}", "window": xw, "resample_tf": xtf},
+        ))
+
+    # --------------------------------------------------------------------------
+    # Grid 5: Allocator sticky threshold sweep on best single strategy
+    # --------------------------------------------------------------------------
+    for thresh in [0.02, 0.05, 0.10]:
+        cfg = {**allocator_cfg, "sticky_threshold": thresh}
+        jobs.append(job(
+            f"MACD_w24_15min_sticky{thresh}",
+            {"kind": "MACD", "name": "MACD_24_15min", "window": 24, "resample_tf": "15min"},
+            alloc_cfg=cfg,
+        ))
+
+    return jobs
+
+
+# ==============================================================================
+# RESULTS
+# ==============================================================================
+def print_summary(results: List[Dict]):
+    """Print a ranked summary table sorted by composite score."""
+    valid = [r for r in results if "error" not in r]
+    valid.sort(key=lambda r: r.get("composite", -999), reverse=True)
+
+    col = "{:<35} {:>8} {:>8} {:>8} {:>8} {:>8} {:>7} {:>6}"
+    hdr = col.format("Label", "Return%", "Sharpe", "Sortino", "Calmar", "Composite", "Trades", "Time(s)")
+    print("\n" + "=" * len(hdr))
+    print("  GRID SEARCH RESULTS  (ranked by composite score)")
+    print("=" * len(hdr))
+    print(hdr)
+    print("-" * len(hdr))
+    for r in valid:
+        print(col.format(
+            r["label"][:35],
+            f"{r['total_return']:+.2f}",
+            f"{r['sharpe']:.4f}",
+            f"{r['sortino']:.4f}",
+            f"{r['calmar']:.4f}",
+            f"{r['composite']:.4f}",
+            r["total_trades"],
+            r["elapsed_s"],
+        ))
+
+    errors = [r for r in results if "error" in r]
+    if errors:
+        print(f"\n  {len(errors)} jobs failed:")
+        for r in errors:
+            print(f"    [{r.get('label','?')}] {r['error']}")
+
+    print("=" * len(hdr))
+
+    # Save full results to CSV
+    out_path = os.path.join(_FILE_DIR, "grid_results.csv")
+    rows = []
+    for r in valid:
+        rows.append({
+            "label":         r["label"],
+            "total_return":  r["total_return"],
+            "sharpe":        r["sharpe"],
+            "sortino":       r["sortino"],
+            "calmar":        r["calmar"],
+            "composite":     r["composite"],
+            "max_drawdown":  r["max_drawdown"],
+            "total_trades":  r["total_trades"],
+            "total_fees":    r["total_fees_usd"],
+            "elapsed_s":     r["elapsed_s"],
         })
-
-    return {
-        "BTC/USD": make_series(42000),
-        "ETH/USD": make_series(2500, drift=0.00003),
-        "BNB/USD": make_series(300, drift=-0.00001, vol=0.003),
-    }
+    pd.DataFrame(rows).to_csv(out_path, index=False)
+    print(f"\n  Full results saved to {out_path}\n")
 
 
-# ==============================================================================
-# RESULTS DISPLAY
-# ==============================================================================
-
-def print_results(results: dict, strategy_names: list):
-    print("\n" + "=" * 55)
-    print("  BACKTEST RESULTS")
-    print("=" * 55)
-    print(f"  Strategies:       {', '.join(strategy_names)}")
-    print(f"  Initial value:    ${results['initial_value']:>12,.2f}")
-    print(f"  Final value:      ${results['final_value']:>12,.2f}")
-    print(f"  Total return:     {results['total_return']:>+11.3f}%")
-    print(f"  Max drawdown:     {results['max_drawdown']:>+11.3f}%")
-    print("-" * 55)
-    print(f"  Sharpe ratio:     {results['sharpe']:>12.4f}")
-    print(f"  Sortino ratio:    {results['sortino']:>12.4f}")
-    print(f"  Calmar ratio:     {results['calmar']:>12.4f}")
-    print(f"  Composite score:  {results['composite']:>12.4f}  <- competition metric")
-    print("-" * 55)
-    print(f"  Total bars:       {results['total_bars']:>12,}")
-    print(f"  Total trades:     {results['total_trades']:>12,}")
-    print(f"  Buys / Sells:     {results.get('total_buy_trades', 0):>6,} / {results.get('total_sell_trades', 0):<6,}")
-    print(f"  Total fees paid:  ${results['total_fees_usd']:>11,.2f}")
-    print(f"  Avg trade size:   ${results['avg_trade_notional']:>11,.2f}")
-    print("=" * 55 + "\n")
-
-
-def plot_equity_curve(results: dict):
+def plot_top_equity_curves(results: List[Dict], top_n: int = 5):
     try:
         import matplotlib.pyplot as plt
-        curve = results["equity_curve"]
-        bars  = [e["bar"]   for e in curve]
-        vals  = [e["value"] for e in curve]
+        valid = sorted(
+            [r for r in results if "equity_curve" in r],
+            key=lambda r: r.get("composite", -999),
+            reverse=True
+        )[:top_n]
 
-        fig, ax = plt.subplots(figsize=(12, 4))
-        ax.plot(bars, vals, linewidth=1.2, color="#534AB7")
-        ax.axhline(results["initial_value"], color="#888", linewidth=0.8, linestyle="--")
-        ax.set_title("Portfolio equity curve")
-        ax.set_xlabel("Bar number")
+        fig, ax = plt.subplots(figsize=(14, 5))
+        colors  = ["#534AB7", "#1D9E75", "#D85A30", "#BA7517", "#D4537E"]
+        for i, r in enumerate(valid):
+            curve = r["equity_curve"]
+            bars  = [e["bar"]   for e in curve]
+            vals  = [e["value"] for e in curve]
+            ax.plot(bars, vals, linewidth=1.2, color=colors[i % len(colors)],
+                    label=f"{r['label']} (composite={r['composite']:.3f})")
+
+        ax.axhline(1_000_000, color="#aaa", linewidth=0.8, linestyle="--")
+        ax.set_title(f"Top {top_n} configurations by composite score")
+        ax.set_xlabel("Bar")
         ax.set_ylabel("Portfolio value (USD)")
         ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: f"${x:,.0f}"))
+        ax.legend(fontsize=9)
         plt.tight_layout()
-        os.makedirs("backtest", exist_ok=True)
-        plt.savefig("backtest/equity_curve.png", dpi=150)
-        print("  Equity curve saved to backtest/equity_curve.png")
+        out = os.path.join(_FILE_DIR, "top_equity_curves.png")
+        plt.savefig(out, dpi=150)
+        print(f"  Top equity curves saved to {out}")
         plt.close()
     except ImportError:
-        print("  (matplotlib not installed - skipping equity curve plot)")
+        print("  (matplotlib not installed — skipping plot)")
 
 
 # ==============================================================================
 # MAIN
 # ==============================================================================
-
-async def main():
+def main():
     # ------------------------------------------------------------------
-    # 1. Load data
+    # 1. Load data (once, in main process)
     # ------------------------------------------------------------------
-    csv_path = "./data/close_5m.csv"
+    #csv_path = os.path.join(_STRAT_ROOT, "data", "returns_5m.csv")
+    csv_path="./strategies/backtest/data/returns_5m.csv"#Ran from root of repo
 
     if os.path.exists(csv_path):
-
-        # All 20 symbols at native 5min resolution
-        price_data = load_pivoted_csv(csv_path)
-
-        # Subset to specific symbols:
-        # price_data = load_pivoted_csv(csv_path, symbols=[
-        #     'BTCUSDT', 'ETHUSDT', 'BNBUSDT', 'SOLUSDT', 'ADAUSDT',
-        # ])
-
-        # Resample to a slower timeframe (strategies pick this up automatically):
-        # price_data = load_pivoted_csv(csv_path, resample_tf='1h')
-        # price_data = load_pivoted_csv(csv_path, resample_tf='15min')
-
+        price_data = load_pivoted_csv(
+            csv_path,
+            # symbols=['BTCUSDT','ETHUSDT','BNBUSDT','SOLUSDT','ADAUSDT'],  # subset
+            # resample_tf='1h',      # resample for slower strategies
+            start_date='2025-10-01', # slice to reduce runtime during dev
+        )
     else:
-        print(f"CSV not found at '{csv_path}' - using synthetic data.\n")
+        print(f"CSV not found at {csv_path} — using synthetic data.")
         price_data = load_sample_data()
 
-    symbols = [pair.replace("/USD", "") for pair in price_data.keys()]
-    print(f"Running on {len(symbols)} pairs: {symbols}\n")
+    n_bars = max(len(df) for df in price_data.values())
+    print(f"Data: {len(price_data)} pairs × {n_bars:,} bars\n")
 
     # ------------------------------------------------------------------
-    # 2. Shared in-memory DB
+    # 2. Base allocator config (some jobs override individual keys)
     # ------------------------------------------------------------------
-    bt_db = DatabaseManager(":memory:")
-
-    # ------------------------------------------------------------------
-    # 3. Strategies
-    #    window=6 on 1h-resampled data = 6-bar (6h) lookback,
-    #    matching your best backtest result.
-    # ------------------------------------------------------------------
-    strategies = [
-        MACDStrategy("MACD_1h",  symbols, window=6,  db_path=":memory:"),
-        CrossSectionalMomentum("XSMom", symbols, window=24, db_path=":memory:"),
-        BollingerReversion("Bollinger", symbols, window=12, db_path=":memory:"),
-        AdaptiveRSI("AdaptRSI", symbols, rsi_window=14, percentile_window=100, db_path=":memory:"),
-        # VWAPReversion("VWAP", symbols, window=14, db_path=":memory:"),
-    ]
-    for strat in strategies:
-        strat.db = bt_db
-
-    # ------------------------------------------------------------------
-    # 4. Allocator config
-    # ------------------------------------------------------------------
-    cfg = {
+    allocator_cfg = {
         "max_single_coin":   0.30,
         "min_cash_fraction": 0.20,
         "sticky_threshold":  0.05,
@@ -284,23 +473,52 @@ async def main():
     }
 
     # ------------------------------------------------------------------
-    # 5. Engine
+    # 3. Build job list
     # ------------------------------------------------------------------
-    engine        = BacktestEngine(price_data=price_data, initial_cash=1_000_000.0, cfg=cfg)
-    engine.db     = bt_db
-    engine.broker = MockBroker(1_000_000.0, price_data)
-
-    warmup_bars = max(strat.lookback for strat in strategies)
-    print(f"Warmup: {warmup_bars} bars ({warmup_bars * 5 / 60:.1f} hours at 5min)\n")
-
-    results = await engine.run(strategies, warmup_bars=warmup_bars)
+    jobs = build_jobs(price_data, allocator_cfg, initial_cash=1_000_000.0)
+    print(f"Running {len(jobs)} backtest jobs...\n")
 
     # ------------------------------------------------------------------
-    # 6. Output
+    # 4. Run in parallel
+    #    max_workers: None = one worker per CPU core (good default).
+    #    Lower it if you're RAM-constrained (each worker holds a copy of
+    #    price_data in memory — 20 pairs × 896k bars ≈ ~500MB per worker).
     # ------------------------------------------------------------------
-    print_results(results, [s.name for s in strategies])
-    plot_equity_curve(results)
+    n_workers = min(len(jobs), os.cpu_count() or 4)//2
+    print(f"Using {n_workers} worker processes (CPU count: {os.cpu_count()})\n")
+
+    t_start  = time.time()
+    results  = []
+
+    with concurrent.futures.ProcessPoolExecutor(max_workers=n_workers) as pool:
+        futures = {pool.submit(_worker, job): job["label"] for job in jobs}
+
+        for future in concurrent.futures.as_completed(futures):
+            label = futures[future]
+            try:
+                result = future.result()
+                results.append(result)
+                print(
+                    f"  [{label:<35}] "
+                    f"composite={result.get('composite', 'ERR'):>8.4f}  "
+                    f"return={result.get('total_return', 0):>+7.2f}%  "
+                    f"trades={result.get('total_trades', 0):>5}  "
+                    f"({result.get('elapsed_s', 0):.1f}s)"
+                )
+            except Exception as e:
+                results.append({"label": label, "error": str(e)})
+                print(f"  [{label:<35}] ERROR: {e}")
+
+    total_elapsed = time.time() - t_start
+    print(f"\nAll jobs finished in {total_elapsed:.1f}s")
+
+    # ------------------------------------------------------------------
+    # 5. Summary
+    # ------------------------------------------------------------------
+    print_summary(results)
+    plot_top_equity_curves(results, top_n=5)
 
 
+# Guard required for multiprocessing on Windows
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
