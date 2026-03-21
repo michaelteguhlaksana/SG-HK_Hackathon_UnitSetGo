@@ -391,14 +391,21 @@ class TradingBot:
                 await asyncio.sleep(5)
 
     async def execution_cycle(self):
-        """Checks for strategy intents and runs the allocator."""
         while self.is_running:
             try:
+                # Sync to 5-min boundaries, but offset by 60s to give
+                # strategies time to compute and submit after price update
+                now = time.time()
+                sleep_duration = 300 - (now % 300) + 60
+                if sleep_duration > 300:
+                    sleep_duration -= 300
+                await asyncio.sleep(sleep_duration)
+                if not self.is_running:
+                    break
                 await self.run_allocator()
-                await asyncio.sleep(5.0)
             except Exception as e:
                 logger.error(f"Execution cycle error: {e}")
-                await asyncio.sleep(5.0)
+                await asyncio.sleep(5)
 
     async def sync_cycle(self):
         """Keeps local balance and order state accurate."""
