@@ -409,7 +409,7 @@ class TradingBot:
                     break
                 await self.client.handle_get_balance()
                 await self.client.handle_query_order(pending_only=True)
-                await self.db.prune_ticks(hours_to_keep=48)
+                await self.db.prune_ticks(hours_to_keep=72)
             except Exception as e:
                 logger.error(f"Sync cycle error: {e}")
                 await asyncio.sleep(5)
