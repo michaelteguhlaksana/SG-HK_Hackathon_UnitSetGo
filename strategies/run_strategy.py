@@ -26,6 +26,7 @@ Strategy-specific params:
     XSMom:       window
     AdaptRSI:    rsi_window, percentile_window
 
+
 @ MTL 21 March 2026
 '''
 import asyncio
@@ -55,6 +56,8 @@ from technical_indicator import (
     AdaptiveRSI,
 )
 
+from pseudo_stat_arb import PairsStrategy
+
 # ---------------------------------------------------------------------------
 # Logging — format includes strategy name so multi-process logs are readable
 # ---------------------------------------------------------------------------
@@ -75,6 +78,7 @@ STRATEGY_KINDS = {
     "VWAP":      VWAPReversion,
     "XSMom":     CrossSectionalMomentum,
     "AdaptRSI":  AdaptiveRSI,
+    "PairsStrategy": PairsStrategy,
 }
 
 def build_strategy(cfg: dict):
@@ -119,6 +123,16 @@ def build_strategy(cfg: dict):
             rsi_window=cfg.get("rsi_window", 14),
             percentile_window=cfg.get("percentile_window", 100),
         )
+    
+    elif kind == "PairsTrading":
+       return PairsStrategy(
+           **common,
+           pairs=cfg["pairs"],
+           zscore_window=cfg.get("zscore_window", 72),
+           entry_z=cfg.get("entry_z", 2.0),
+           exit_z=cfg.get("exit_z", 0.5),
+           stop_z=cfg.get("stop_z", 3.5),
+       )
 
 
 # ---------------------------------------------------------------------------

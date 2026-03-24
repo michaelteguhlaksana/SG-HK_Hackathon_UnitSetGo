@@ -1,0 +1,57 @@
+{
+    "_comment": "Pairs trading — 5-min native resolution, matching run_pipeline(df_prices) backtest exactly.",
+
+    "strategy":      "PairsTrading",
+    "name":          "Pairs_5min",
+
+    "_tf_comment":   "null = native 5-min bars, matching RESAMPLE_TF=None in the backtest.",
+    "resample_tf":   null,
+
+    "_lookback_comment": "Must cover zscore_window + warmup. Base class fetches lookback * 2 raw bars, so 600 gives ~1200 bars headroom.",
+    "lookback":      500,
+
+    "_zscore_comment": "Must match ROLLING_WINDOW=500 from the backtest pipeline exactly.",
+    "zscore_window": 500,
+
+    "_z_comment":    "entry/exit/stop match ENTRY_Z=2.0, EXIT_Z=0.5, STOP_Z=3.5 from the backtest.",
+    "entry_z":       2.0,
+    "exit_z":        0.5,
+    "stop_z":        3.5,
+
+    "_poll_comment": "Poll every 30s — allocator fires on PENDING intents, so we emit ~every 5-min bar boundary.",
+    "poll_interval": 30.0,
+
+    "db_path":       "../trading_system/config/trading_bot.db",
+
+    "_pairs_comment": "Beta/alpha from walk-forward OLS fit on TRAIN set (5-min log prices, Oct 2025 - Jan 2026). Re-fit monthly.",
+    "pairs": [
+        {
+            "_note":  "Sharpe 3.11 OOS | half-life 353 bars (~29h) | no strong economic link — monitor closely",
+            "dep":    "AVAX",
+            "indep":  "DOGE",
+            "beta":   1.2029,
+            "alpha":  4.9703
+        },
+        {
+            "_note":  "Sharpe 3.01 OOS | half-life 583 bars (~49h) | cleanest pair, max DD only 3.7%",
+            "dep":    "BTC",
+            "indep":  "BNB",
+            "beta":   0.8192,
+            "alpha":  5.8611
+        },
+        {
+            "_note":  "Sharpe 2.97 OOS | half-life 349 bars (~29h) | SOL/BTC risk-on/off cycle",
+            "dep":    "SOL",
+            "indep":  "BTC",
+            "beta":   1.6665,
+            "alpha":  -14.1224
+        },
+        {
+            "_note":  "Sharpe 2.86 OOS | half-life 622 bars (~52h) | LINK/SOL DeFi/L1 relationship",
+            "dep":    "LINK",
+            "indep":  "SOL",
+            "beta":   0.8907,
+            "alpha":  -1.7813
+        }
+    ]
+}
