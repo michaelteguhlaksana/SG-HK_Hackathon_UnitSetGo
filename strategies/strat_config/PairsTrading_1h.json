@@ -21,7 +21,9 @@
     "_poll_comment": "Poll every 30s — allocator fires on PENDING intents, so we emit ~every 5-min bar boundary.",
     "poll_interval": 30.0,
 
-    "db_path":       "../trading_system/config/trading_bot.db",
+    "db_path":       "./trading_system/database.db",
+
+    "symbols":["AVAX", "DOGE", "BTC", "BNB", "SOL", "LINK"],
 
     "_pairs_comment": "Beta/alpha from walk-forward OLS fit on TRAIN set (5-min log prices, Oct 2025 - Jan 2026). Re-fit monthly.",
     "pairs": [
