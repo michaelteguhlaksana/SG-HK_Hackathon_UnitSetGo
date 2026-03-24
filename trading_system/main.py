@@ -103,34 +103,12 @@ class TradingBot:
           5. Apply sticky threshold to suppress low-value rebalances.
           6. Execute required trades (sells first, then buys).
         """
-        # ------------------------------------------------------------------
-        # STEP 1: Fetch Environment
-        # ------------------------------------------------------------------
-        pairs_with_usd = [f"{sym}/USD" for sym in avg_convictions.keys()]
-        history = await self.db.get_tick_history_batch(
-            pairs=pairs_with_usd,
-            limit=self.cfg["vol_lookback"]
-        )
-
-        price_series = {}
-        for pair, ticks in history.items():
-            coin = pair.replace("/USD", "")
-            if len(ticks) >= 2:
-                price_series[coin] = [t['price'] for t in ticks]
-
-        df_prices     = pd.DataFrame(price_series) if price_series else pd.DataFrame()
-        latest_prices = await self.db.get_latest_price_batch()
-
-        balance = self.client.balance
-        if not balance:
-            logger.warning("Allocator: balance is empty, skipping cycle.")
-            for i_id in intent_ids:
-                await self.db.update_intent_status(i_id, "REJECTED")
-            return
+        
         
         # ------------------------------------------------------------------
-        # STEP 2: Weighted Conviction Pooling
+        # STEP 1: Weighted Conviction Pooling
         # ------------------------------------------------------------------
+        latest_prices = await self.db.get_latest_price_batch()
         pending_intents = await self.db.get_pending_intents()
         if not pending_intents:
             return
@@ -175,7 +153,31 @@ class TradingBot:
         for i_id in intent_ids:
             await self.db.update_intent_status(i_id, "PROCESSING")
 
+        # ------------------------------------------------------------------
+        # STEP 2: Fetch Environment
+        # ------------------------------------------------------------------
+        pairs_with_usd = [f"{sym}/USD" for sym in avg_convictions.keys()]
+        #pairs_with_usd = [f"{sym}/USD" for sym in ["BTC",  "ETH",  "SOL",  "XRP",  "BNB",  "DOGE",  "ZEC",  "SUI",  "ASTER",  "ADA",  "PEPE",  "AVAX",  "LINK",  "ENA",  "PUMP",  "LTC",  "TRX",  "XPL",  "PAXG",  "NEAR"]]
+        history = await self.db.get_tick_history_batch(
+            pairs=pairs_with_usd,
+            limit=self.cfg["vol_lookback"]
+        )
+
+        price_series = {}
+        for pair, ticks in history.items():
+            coin = pair.replace("/USD", "")
+            if len(ticks) >= 2:
+                price_series[coin] = [t['price'] for t in ticks]
+
+        df_prices     = pd.DataFrame(price_series) if price_series else pd.DataFrame()
         
+
+        balance = self.client.balance
+        if not balance:
+            logger.warning("Allocator: balance is empty, skipping cycle.")
+            for i_id in intent_ids:
+                await self.db.update_intent_status(i_id, "REJECTED")
+            return
 
         # ------------------------------------------------------------------
         # STEP 3: Current Portfolio Valuation
