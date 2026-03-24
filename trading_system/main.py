@@ -72,6 +72,7 @@ class TradingBot:
                 "MACD_1h_6h":    3.0,
                 "XSMom_1h_24h":  3.0,
                 "MACD_15m_6h":   1.0, #Curently not used due to high turnover
+                "Pairs_5min":    2.0,   # meaningful but not dominant
             },
         }
 
