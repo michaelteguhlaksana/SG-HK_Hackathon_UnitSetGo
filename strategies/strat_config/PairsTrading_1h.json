@@ -8,7 +8,7 @@
     "resample_tf":   null,
 
     "_lookback_comment": "Must cover zscore_window + warmup. Base class fetches lookback * 2 raw bars, so 600 gives ~1200 bars headroom.",
-    "lookback":      500,
+    "lookback":      600,
 
     "_zscore_comment": "Must match ROLLING_WINDOW=500 from the backtest pipeline exactly.",
     "zscore_window": 500,
