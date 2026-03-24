@@ -73,6 +73,7 @@ class PairsStrategy(BaseStrategy):
         entry_z: float = 2.0,
         exit_z: float = 0.5,
         stop_z: float = 3.5,
+        **kwargs
     ):
         # Collect all unique symbols for the BaseStrategy DB subscription
         all_symbols = list({
@@ -89,7 +90,7 @@ class PairsStrategy(BaseStrategy):
             lookback=lookback,
         )
  
-        self.pairs         = pairs
+        self.pairs_config         = pairs
         self.zscore_window = zscore_window
         self.entry_z       = entry_z
         self.exit_z        = exit_z
@@ -227,7 +228,7 @@ class PairsStrategy(BaseStrategy):
         # so we can log the net view per coin before submitting
         coin_convictions: Dict[str, List[float]] = {}
  
-        for pair in self.pairs:
+        for pair in self.pairs_config:
             dep   = pair["dep"]
             indep = pair["indep"]
             beta  = float(pair["beta"])
