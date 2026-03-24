@@ -78,7 +78,7 @@ STRATEGY_KINDS = {
     "VWAP":      VWAPReversion,
     "XSMom":     CrossSectionalMomentum,
     "AdaptRSI":  AdaptiveRSI,
-    "PairsStrategy": PairsStrategy,
+    "PairsTrading": PairsStrategy,
 }
 
 def build_strategy(cfg: dict):
