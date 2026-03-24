@@ -95,21 +95,57 @@ class TradingBot:
         Portfolio Allocator — called every execution cycle.
 
         Pipeline:
-          1. Collect & pool pending conviction signals from strategies.
-          2. Fetch environment: prices, volatility history, current balance.
+          1. Fetch environment: prices, volatility history, current balance.
+          2. Collect & pool pending conviction signals from strategies.
           3. Compute target weights via conviction-weighted risk parity.
           4. Apply cash floor and single-coin cap.
           5. Apply sticky threshold to suppress low-value rebalances.
           6. Execute required trades (sells first, then buys).
         """
         # ------------------------------------------------------------------
-        # STEP 1: Weighted Conviction Pooling
+        # STEP 1: Fetch Environment
+        # ------------------------------------------------------------------
+        pairs_with_usd = [f"{sym}/USD" for sym in avg_convictions.keys()]
+        history = await self.db.get_tick_history_batch(
+            pairs=pairs_with_usd,
+            limit=self.cfg["vol_lookback"]
+        )
+
+        price_series = {}
+        for pair, ticks in history.items():
+            coin = pair.replace("/USD", "")
+            if len(ticks) >= 2:
+                price_series[coin] = [t['price'] for t in ticks]
+
+        df_prices     = pd.DataFrame(price_series) if price_series else pd.DataFrame()
+        latest_prices = await self.db.get_latest_price_batch()
+
+        balance = self.client.balance
+        if not balance:
+            logger.warning("Allocator: balance is empty, skipping cycle.")
+            for i_id in intent_ids:
+                await self.db.update_intent_status(i_id, "REJECTED")
+            return
+        
+        # ------------------------------------------------------------------
+        # STEP 2: Weighted Conviction Pooling
         # ------------------------------------------------------------------
         pending_intents = await self.db.get_pending_intents()
         if not pending_intents:
             return
 
-        strategy_weights = self.cfg.get("strategy_weights", {})
+        all_pairs = list(latest_prices.keys())
+        history_for_vol = await self.db.get_tick_history_batch(
+            pairs=all_pairs, limit=288
+        )
+        price_series_vol = {}
+        for pair, ticks in history_for_vol.items():
+            coin = pair.replace("/USD", "")
+            if len(ticks) >= 13:
+                price_series_vol[coin] = [t['price'] for t in ticks]
+
+        df_vol = pd.DataFrame(price_series_vol) if price_series_vol else pd.DataFrame()
+        strategy_weights = self._compute_strategy_weights(df_vol)
 
         weighted_sums: Dict[str, float] = {}
         total_weights: Dict[str, float] = {}
@@ -138,30 +174,7 @@ class TradingBot:
         for i_id in intent_ids:
             await self.db.update_intent_status(i_id, "PROCESSING")
 
-        # ------------------------------------------------------------------
-        # STEP 2: Fetch Environment
-        # ------------------------------------------------------------------
-        pairs_with_usd = [f"{sym}/USD" for sym in avg_convictions.keys()]
-        history = await self.db.get_tick_history_batch(
-            pairs=pairs_with_usd,
-            limit=self.cfg["vol_lookback"]
-        )
-
-        price_series = {}
-        for pair, ticks in history.items():
-            coin = pair.replace("/USD", "")
-            if len(ticks) >= 2:
-                price_series[coin] = [t['price'] for t in ticks]
-
-        df_prices     = pd.DataFrame(price_series) if price_series else pd.DataFrame()
-        latest_prices = await self.db.get_latest_price_batch()
-
-        balance = self.client.balance
-        if not balance:
-            logger.warning("Allocator: balance is empty, skipping cycle.")
-            for i_id in intent_ids:
-                await self.db.update_intent_status(i_id, "REJECTED")
-            return
+        
 
         # ------------------------------------------------------------------
         # STEP 3: Current Portfolio Valuation
@@ -274,6 +287,76 @@ class TradingBot:
     # --------------------------------------------------------------------------
     # ALLOCATOR HELPERS
     # --------------------------------------------------------------------------
+
+    def _compute_strategy_weights(self, df_prices: pd.DataFrame) -> Dict[str, float]:
+        """
+        Dynamically adjust strategy weights based on recent market volatility.
+        
+        High vol regime  → momentum strategies weighted higher
+        Low vol regime   → mean reversion strategies weighted higher
+        
+        Vol is measured as the average 1h rolling std across all coins,
+        normalised against the 24h baseline.
+        """
+        base_weights = self.cfg["strategy_weights"].copy()
+        
+        if df_prices.empty or len(df_prices) < 13:
+            # Not enough history — use base weights
+            return base_weights
+
+        returns = df_prices.pct_change().dropna()
+
+        # Recent vol: last 12 bars = 1 hour of 5-min bars
+        recent_vol   = returns.tail(12).std().mean()
+
+        # Baseline vol: last 288 bars = 24 hours
+        baseline_vol = returns.tail(288).std().mean()
+
+        if baseline_vol <= 0:
+            return base_weights
+
+        # Normalised vol ratio: >1 = high vol, <1 = low vol
+        vol_ratio = recent_vol / (baseline_vol + 1e-9)
+
+        # Smooth the ratio to avoid rapid weight flipping
+        # Clamp to [0.3, 3.0] to prevent extreme adjustments
+        vol_ratio = float(np.clip(vol_ratio, 0.3, 3.0))
+
+        logger.info(f"Vol regime: recent={recent_vol:.6f} baseline={baseline_vol:.6f} ratio={vol_ratio:.2f}")
+
+        # --- Apply regime scaling ---
+        # Momentum strategies scale UP with vol_ratio
+        # Mean reversion strategies scale DOWN with vol_ratio (inverse)
+        momentum_strategies    = {"MACD_1h_6h", "XSMom_1h_24h", "MACD_15m_6h"}
+        mean_reversion_strategies = {"Bollinger_4h", "AdaptRSI_1h", "MACDDiv_1h"}
+        # RiskManager always stays fixed regardless of regime
+        fixed_strategies       = {"RiskManager"}
+
+        dynamic_weights = {}
+        for name, base_w in base_weights.items():
+            if name in fixed_strategies:
+                dynamic_weights[name] = base_w
+
+            elif name in momentum_strategies:
+                # Scale up in high vol, scale down in low vol
+                # vol_ratio=2.0 → weight × 1.4
+                # vol_ratio=0.5 → weight × 0.7
+                scalar = np.sqrt(vol_ratio)
+                dynamic_weights[name] = round(base_w * scalar, 3)
+
+            elif name in mean_reversion_strategies:
+                # Scale up in low vol, scale down in high vol
+                # vol_ratio=2.0 → weight × 0.7
+                # vol_ratio=0.5 → weight × 1.4
+                scalar = 1.0 / np.sqrt(vol_ratio)
+                dynamic_weights[name] = round(base_w * scalar, 3)
+
+            else:
+                # Unknown strategy — use base weight unchanged
+                dynamic_weights[name] = base_w
+
+        logger.info(f"Dynamic weights: {dynamic_weights}")
+        return dynamic_weights
 
     def _calculate_target_weights(
         self,
