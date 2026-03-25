@@ -331,7 +331,7 @@ class TradingBot:
         # Momentum strategies scale UP with vol_ratio
         # Mean reversion strategies scale DOWN with vol_ratio (inverse)
         momentum_strategies    = {"MACD_1h_6h", "XSMom_1h_24h", "MACD_15m_6h"}
-        mean_reversion_strategies = {"Bollinger_4h", "AdaptRSI_1h", "MACDDiv_1h"}
+        mean_reversion_strategies = {"Bollinger_4h", "AdaptRSI_1h", "MACDDiv_1h", "Pairs_5min"}
         # RiskManager always stays fixed regardless of regime
         fixed_strategies       = {"RiskManager"}
 
