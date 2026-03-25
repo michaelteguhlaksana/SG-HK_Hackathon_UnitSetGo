@@ -38,6 +38,7 @@ class TradingBot:
         )
         self.is_running = True
         self.tasks = []
+        self._conviction_state: Dict[str, Dict[str, tuple]] = {}
 
         # --- Allocator Configuration ---
         # Tune these during the competition without changing logic.
@@ -74,6 +75,17 @@ class TradingBot:
                 "MACD_15m_6h":   1.0, #Curently not used due to high turnover
                 "Pairs_5min":    2.0,   # meaningful but not dominant
             },
+        }
+
+        # Half-life in seconds for each strategy's conviction decay
+        # Hourly strategies: 3600s half-life (conviction halves after 1h)
+        # 15min strategies: 900s half-life
+        # 5min strategies: 300s half-life
+        self._conviction_half_lives = {
+            "MACD_1h_6h":    3600.0,
+            "XSMom_1h_24h":  3600.0,
+            "MACD_15m_6h":    900.0,
+            "Pairs_5min":     300.0,
         }
 
     async def initialize(self):
@@ -129,23 +141,48 @@ class TradingBot:
         weighted_sums: Dict[str, float] = {}
         total_weights: Dict[str, float] = {}
         intent_ids = []
+        now_ms = int(time.time() * 1000)
 
+        # Update state with fresh intents
         for intent in pending_intents:
             sym        = intent['symbol']
             conviction = float(intent['conviction'])
             strat_name = intent['strategy_name']
-            weight     = strategy_weights.get(strat_name, 1.0)
 
-            weighted_sums.setdefault(sym, 0.0)
-            total_weights.setdefault(sym, 0.0)
+            if strat_name not in self._conviction_state:
+                self._conviction_state[strat_name] = {}
 
-            weighted_sums[sym] += conviction * weight
-            total_weights[sym] += weight
+            self._conviction_state[strat_name][sym] = (conviction, now_ms)
             intent_ids.append(intent['id'])
 
-        avg_convictions: Dict[str, float] = {
+        # Pool with decay applied
+        weighted_sums: Dict[str, float] = {}
+        total_weights: Dict[str, float] = {}
+
+        for strat_name, coin_states in self._conviction_state.items():
+            weight    = strategy_weights.get(strat_name, 1.0)
+            half_life = self._conviction_half_lives.get(strat_name, 300.0)
+            half_life_ms = half_life * 1000
+
+            for sym, (conviction, ts) in coin_states.items():
+                age_ms  = now_ms - ts
+                # Exponential decay: conviction × 0.5^(age / half_life)
+                decay   = 0.5 ** (age_ms / half_life_ms)
+                decayed = conviction * decay
+
+                # Drop stale convictions that have decayed below 5% of original
+                if abs(decayed) < 0.05:
+                    continue
+
+                weighted_sums.setdefault(sym, 0.0)
+                total_weights.setdefault(sym, 0.0)
+                weighted_sums[sym] += decayed * weight
+                total_weights[sym] += weight
+
+        avg_convictions = {
             sym: weighted_sums[sym] / total_weights[sym]
             for sym in weighted_sums
+            if total_weights.get(sym, 0) > 0
         }
 
         logger.info(f"Allocator: pooled convictions = {avg_convictions}")
