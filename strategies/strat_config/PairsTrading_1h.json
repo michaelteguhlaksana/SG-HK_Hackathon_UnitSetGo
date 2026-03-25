@@ -18,8 +18,8 @@
     "exit_z":        0.5,
     "stop_z":        3.5,
 
-    "_poll_comment": "Poll every 30s — allocator fires on PENDING intents, so we emit ~every 5-min bar boundary.",
-    "poll_interval": 30.0,
+    "_poll_comment": "Poll every 300s — allocator fires on PENDING intents, so we emit ~every 5-min bar boundary.",
+    "poll_interval": 300.0,
 
     "db_path":       "./trading_system/database.db",
 
