@@ -99,6 +99,22 @@ class TradingBot:
             if not is_live:
                 logger.warning("Exchange is NOT running (IsRunning=False).")
 
+        recent_intents = await self.db.get_recent_intents(hours=1.0)
+        for intent in recent_intents:
+            sym        = intent['symbol']
+            conviction = float(intent['conviction'])
+            strat_name = intent['strategy_name']
+            ts         = intent['timestamp']
+
+            if strat_name not in self._conviction_state:
+                self._conviction_state[strat_name] = {}
+            
+            # Replay history into state (Because the query orders ASC, 
+            # the newest intent for each pair will naturally overwrite older ones)
+            self._conviction_state[strat_name][sym] = (conviction, ts)
+            
+        logger.info(f"Hydrated state for {len(self._conviction_state)} strategies.")
+
     # ==========================================================================
     #  ALLOCATOR
     # ==========================================================================

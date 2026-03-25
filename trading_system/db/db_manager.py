@@ -149,6 +149,22 @@ class DatabaseManager:
             """, (intent['name'], intent['symbol'].upper(), conviction, ts))
             await db.commit()
 
+    async def get_recent_intents(self, hours: float = 1.0) -> List[Dict]:
+        """
+        Fetches ALL intents (PENDING, PROCESSING, EXECUTED) from the last N hours.
+        Sorted oldest to newest. Perfect for hydrating time-decay state on restart.
+        """
+        cutoff_ts = int((time.time() - (hours * 3600)) * 1000)
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute("""
+                SELECT * FROM order_intents 
+                WHERE timestamp >= ? 
+                ORDER BY timestamp ASC
+            """, (cutoff_ts,)) as cursor:
+                rows = await cursor.fetchall()
+                return [dict(row) for row in rows]
+
     async def get_pending_intents(self) -> List[Dict]:
         """Called by the Master Allocator to collect unprocessed signals."""
         async with aiosqlite.connect(self.db_path) as db:
