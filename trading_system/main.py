@@ -52,7 +52,7 @@ class TradingBot:
 
             # Don't rebalance a coin unless its weight diff exceeds this.
             # Reduces turnover. Raise if fees are hurting you.
-            "sticky_threshold":  0.075,
+            "sticky_threshold":  0.05,
 
             # Lookback window for volatility calculation (number of 5-min bars).
             # 288 = 24 hours at 5-min intervals.
@@ -60,7 +60,7 @@ class TradingBot:
 
             # Minimum USD notional for a trade to be sent.
             # Avoids API rejections and pointless micro-trades.
-            "min_trade_usd":     1500.0,
+            "min_trade_usd":     2500.0,
 
             # Decay factor for exponentially-weighted volatility (0 < λ < 1).
             # Higher = more weight on recent vol. Set to None for simple std.
