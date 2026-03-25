@@ -125,14 +125,17 @@ def build_strategy(cfg: dict):
         )
     
     elif kind == "PairsTrading":
-       return PairsStrategy(
-           **common,
-           pairs=cfg["pairs"],
-           zscore_window=cfg.get("zscore_window", 72),
-           entry_z=cfg.get("entry_z", 2.0),
-           exit_z=cfg.get("exit_z", 0.5),
-           stop_z=cfg.get("stop_z", 3.5),
-       )
+        return PairsStrategy(
+            strategy_name=cfg.get("name", "PairsTrading"),
+            pairs=cfg["pairs"],
+            db_path=cfg.get("db_path", "./trading_bot.db"),
+            resample_tf=cfg.get("resample_tf", None),
+            lookback=cfg.get("lookback", 120),
+            zscore_window=cfg.get("zscore_window", 72),
+            entry_z=cfg.get("entry_z", 2.0),
+            exit_z=cfg.get("exit_z", 0.5),
+            stop_z=cfg.get("stop_z", 3.5),
+        )
 
 
 # ---------------------------------------------------------------------------
